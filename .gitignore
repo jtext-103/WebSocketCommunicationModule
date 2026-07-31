@@ -1,0 +1,30 @@
+# Build output
+bin/
+obj/
+
+# Test output
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# User-specific IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.rsuser
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Local review notes
+DOCUMENT_REVIEW_CHECKLIST.md
+NUGET_RELEASE_REVIEW.md

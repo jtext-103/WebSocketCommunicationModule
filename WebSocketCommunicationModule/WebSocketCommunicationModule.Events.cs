@@ -1,0 +1,53 @@
+using System;
+using Jtext103.CFET2.Core.Event;
+using Jtext103.CFET2.WebSocketCommunicationModule.Connections;
+
+namespace Jtext103.CFET2.WebSocketCommunicationModule
+{
+    public partial class WebSocketCommunicationModule
+    {
+        private void RaiseRemoteEvent(RemoteEndpointKey endpoint, EventArg eventArg)
+        {
+            if (eventArg == null || disposed)
+            {
+                return;
+            }
+
+            eventArg.Host = endpoint.NormalizedHost;
+            if (eventArg.Sample != null)
+            {
+                eventArg.Sample.IsRemote = true;
+            }
+
+            InvokeEventCallback(eventArg);
+        }
+
+
+
+        private void InvokeEventCallback(EventArg eventArg)
+        {
+            Action<EventArg>? callback;
+            lock (callbackLock)
+            {
+                callback = eventCallback;
+            }
+
+            if (callback == null || disposed)
+            {
+                return;
+            }
+
+            try
+            {
+                callback(eventArg);
+            }
+            catch
+            {
+                // Callback failures must not stop connection or recieve-loop state machines.
+                logger.Error("Attention: EventCallback failed! the reomte event won't recieved callback!");
+            }
+        }
+
+
+    }
+}
