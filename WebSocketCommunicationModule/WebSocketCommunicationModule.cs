@@ -1,4 +1,4 @@
-﻿using Jtext103.CFET2.Core.Communication;
+using Jtext103.CFET2.Core.Communication;
 using Jtext103.CFET2.Core.Event;
 using Jtext103.CFET2.Core.Log;
 using Jtext103.CFET2.WebSocketCommunicationModule.Client;
@@ -26,7 +26,6 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
         private volatile bool started;
         private volatile bool disposed;
 
-        private readonly ICfet2Logger logger = Cfet2LogManager.GetLogger("WebSocket");
 
         public WebSocketCommunicationModule(Uri uri)
             : this(new WebSocketCommunicationOptions { ListenUri = uri, EnableServer = uri != null })
@@ -36,6 +35,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
         public WebSocketCommunicationModule(WebSocketCommunicationOptions options)
         {
             this.options = options ?? throw new ArgumentNullException(nameof(options));
+            WebSocketLog.Initialize();
         }
 
         public override void Start()
@@ -51,11 +51,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 base.Start();
                 if (options.EnableServer)
                 {
-                    server ??= new WebSocketEventServer(logger, options, MyHub.EventHub);
+                    server ??= new WebSocketEventServer( options, MyHub);
                     server.Start();
                 }
 
-                logger.Info($"WebSocket running on {options.ListenUri}");
+                WebSocketLog.Logger.Info($"WebSocket running on {options.ListenUri}");
 
                 started = true;
             }
@@ -96,7 +96,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
 
         public override void RegisterEventCallback(Action<EventArg> hander)
         {
-            logger.Info($"WebSocket RegisterEventCallback");
+            WebSocketLog.Logger.Info($"WebSocket RegisterEventCallback");
             if (hander == null)
             {
                 throw new ArgumentNullException(nameof(hander));
@@ -135,7 +135,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 EnqueueClientPlan(plan);
             }
 
-            logger.Info($"Subscribe: {token.Host} filter Count: {filter.SourcesAndTypes.Count}");
+            WebSocketLog.Logger.Info($"Subscribe: {token.Host} filter Count: {filter.SourcesAndTypes.Count}");
         }
 
         public override void UnSubScribe(Token token)

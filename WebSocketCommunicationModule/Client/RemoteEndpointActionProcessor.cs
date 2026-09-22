@@ -7,7 +7,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 {
     internal sealed partial class RemoteEndpointActionProcessor : IDisposable
     {
-        private readonly ICfet2Logger logger;
+
         private readonly Func<bool> isDisposed;
         private readonly Action<Guid, int, EventFilter> addOrUpdateSubscription;
         private readonly Func<Guid, bool> removeSubscription;
@@ -29,7 +29,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private volatile bool disposed;
 
         public RemoteEndpointActionProcessor(
-            ICfet2Logger logger,
+
             Func<bool> isDisposed,
             Action<Guid, int, EventFilter> addOrUpdateSubscription,
             Func<Guid, bool> removeSubscription,
@@ -39,7 +39,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             RemoteEndpointKey? endpoint = null,
             int actionQueueWarningThreshold = int.MaxValue)
         {
-            this.logger = logger;
+
             this.isDisposed = isDisposed;
             this.addOrUpdateSubscription = addOrUpdateSubscription;
             this.removeSubscription = removeSubscription;
@@ -53,7 +53,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         }
 
         public RemoteEndpointActionProcessor(
-            ICfet2Logger logger,
+
             Func<bool> isDisposed,
             Action<Guid, EventFilter> addOrUpdateSubscription,
             Func<Guid, bool> removeSubscription,
@@ -63,7 +63,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             RemoteEndpointKey? endpoint = null,
             int actionQueueWarningThreshold = int.MaxValue)
             : this(
-                logger,
+
                 isDisposed,
                 (tokenId, _, filter) => addOrUpdateSubscription(tokenId, filter),
                 removeSubscription,
@@ -79,7 +79,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             if (disposed || isDisposed())
             {
-                logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
+                WebSocketLog.Logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
                 return;
             }
 
@@ -87,7 +87,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
             if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Subscribe, masterTokenId, revision, remoteFilter)))
             {
-                logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
+                WebSocketLog.Logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
             }
         }
 
@@ -100,7 +100,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             if (disposed || isDisposed())
             {
-                logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
+                WebSocketLog.Logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
                 return;
             }
 
@@ -108,7 +108,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
             if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Unsubscribe, masterTokenId, 0, null)))
             {
-                logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
+                WebSocketLog.Logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
             }
         }
 
@@ -149,7 +149,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     }
                     catch
                     {
-                        logger.Error($"{action} excute error! skip this action!");
+                        WebSocketLog.Logger.Error($"{action} excute error! skip this action!");
                     }
                 }
             }
@@ -174,7 +174,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 count > actionQueueWarningThreshold &&
                 Interlocked.CompareExchange(ref queueWarningActive, 1, 0) == 0)
             {
-                logger.Error(
+                WebSocketLog.Logger.Error(
                     $"WebSocket action queue warning: endpoint={endpoint}, " +
                     $"queueLength={count}, threshold={actionQueueWarningThreshold}.");
             }

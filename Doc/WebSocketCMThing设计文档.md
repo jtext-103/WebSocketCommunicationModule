@@ -1,5 +1,11 @@
 # WebSocketCMThing 状态暴露设计
 
+## 实现状态（2026-09-21）
+
+公开诊断 Thing 和 DTO 已实现。本文保留设计依据及验收清单；清单不是本次测试执行记录。当前 `status.State` 为 Created/Started/Disposed，连接和订阅健康度须结合失败计数、Pending 计数和明细判断。APP 默认挂载路径为 `/WebSocketCM`，自定义宿主可自行命名。
+
+内部诊断已采用 `GetDiagnosticStatus()`、`GetSessionStatuses()` 和计数属性；下文内部扩展建议不应作为现有函数签名直接调用。
+
 ## 1. 文档目的
 
 本文定义 `WebSocketCMThing` 的职责、对外 Status 接口、状态 DTO、快照采集方式和测试要求。
@@ -177,6 +183,7 @@ public sealed class WebSocketModuleStatus
     public int RemoteConnectedClientCount { get; init; }
     public int RemoteFailedClientCount { get; init; }
     public int RemoteSubscriptionCount { get; init; }
+    public int RemotePendingSubscriptionCount { get; init; }
     public int RemoteActiveSubscriptionCount { get; init; }
     public int RemoteFailedSubscriptionCount { get; init; }
 
@@ -190,8 +197,7 @@ public sealed class WebSocketModuleStatus
 | 值 | 条件 |
 | --- | --- |
 | `Created` | 模块尚未 `Start()` |
-| `Running` | 模块已启动且未发现失败状态 |
-| `Degraded` | 模块已启动，但存在 `Failed` 的远端连接或远端订阅 |
+| `Started` | 模块已启动；不代表所有连接或订阅已就绪 |
 | `Disposed` | 模块已释放 |
 
 说明：
@@ -202,6 +208,7 @@ public sealed class WebSocketModuleStatus
 - `RemoteClientCount`：当前 `endpointClients` 数量，包含连接中、重连中和失败的 endpoint client。
 - `RemoteConnectedClientCount`：状态为 `Connected` 的 `RemoteEndpointClient` 数量。
 - `RemoteSubscriptionCount`：客户端侧发往远端的 master token 数。
+- `RemotePendingSubscriptionCount`：各远端客户端 Pending 订阅数量之和；与 Active/Failed 计数一起判断订阅进度。
 - `ClientAggregationGroupCount`：客户端侧按 `endpoint + source + eventType` 聚合后的组数。
 - `LocalSubscriptionCount`：进入 WebSocketCM 的本地 token 数；一个 token 包含多条规则时仍计为一个。
 
@@ -239,9 +246,7 @@ public sealed class WebSocketServerSessionStatus
 
 | 状态 | 含义 |
 | --- | --- |
-| `Handshaking` | WebSocket 已接入，尚未完成 CFET2 hello/helloAck |
-| `Active` | 握手完成，正在接收协议消息 |
-| `Closing` | 正在退出或清理 |
+| `Open` 等 `WebSocketState` 字符串 | 当前底层 socket 状态；通过 `HandshakeCompletedAtUtc` 判断 CFET2 握手是否完成 |
 | `Disposed` | 已释放；通常不会继续出现在活动列表中 |
 
 实现要求：
@@ -251,7 +256,7 @@ public sealed class WebSocketServerSessionStatus
 - `LastReceivedAtUtc` 在收到完整协议消息后更新。
 - session 明细按 `CreatedAtUtc` 升序或 `SessionId` 稳定排序，方便比较两次结果。
 
-当前 `WebSocketSession` 尚未保存 `State`、`RemoteAddress`、创建时间、握手完成时间和最后接收时间，实现时需要补充这些诊断字段。
+当前 `WebSocketSession.GetDiagnosticStatus()` 已返回状态、远端地址、创建时间、握手完成时间和最后接收时间；释放后的快照状态为 `Disposed`，其余使用 `socket.State.ToString()`。
 
 ### 4.3 `remoteClients`
 
@@ -315,10 +320,10 @@ public sealed class WebSocketRemoteSubscriptionStatus
 - `Endpoint` 使用 normalized WebSocket endpoint，例如 `ws://127.0.0.1:8003/cfet2/event/v2`。
 - `State` 直接映射现有 `RemoteConnectionState`。
 - 第一版客户端聚合后，每个 master token 对应单条 `Source + EventType`，DTO 仍应在快照转换时显式读取并校验。
-- `LastError` 只用于诊断，必须限制长度，例如最多 512 个字符，避免把超长远端错误内容直接暴露。
-- `Subscriptions` 按 `Source + EventType + TokenId` 稳定排序。
+- `LastError` 当前直接映射内部错误；512 字符截断属于后续增强建议，不能假定已实现。
+- 当前 `Subscriptions` 按 `Source`、`EventType` 排序。
 
-当前 `RemoteEndpointClient` 已提供 `State`、`SubscriptionCount` 和 `SnapshotSubscriptions()`；实现完整状态还需要从 `RemoteEndpointConnection` 和 `RemoteEndpointActionProcessor` 增加只读诊断快照。
+当前 `RemoteEndpointClient.GetDiagnosticStatus()` 已汇总连接时间、错误、动作队列长度以及订阅明细与状态计数。
 
 ### 4.4 `remoteClient`
 
@@ -350,7 +355,7 @@ ws://ip:port
 - scheme 和 hostname 大小写不敏感。
 - 允许输入末尾 `/`，归一化后再查询。
 - 第一版不接受缺少 scheme 或 port 的字符串。
-- hostname 为 null、空字符串或格式错误时抛出 `ArgumentException`。
+- hostname 为 null、空白或解析抛出 FormatException 时返回 `null`。
 - endpoint 当前不存在时返回 `null`，不得为了查询而创建连接。
 - 返回 DTO 结构与 `remoteClients` 中的单项完全一致，并包含订阅明细。
 
@@ -388,8 +393,8 @@ Print 接口要求：
 - 只负责格式化对应 Get 接口返回的快照，不得重新读取或修改内部通信状态。
 - 输出使用多行纯文本，字段顺序固定，方便人工阅读和测试。
 - 时间统一使用 UTC ISO 8601 格式。
-- 空列表输出明确的 `No server sessions.` 或 `No remote clients.`，不得返回空字符串。
-- `PrintRemoteClient(hostname)` 未找到 endpoint 时返回明确的 `Remote client not found: {hostname}`。
+- 当前 `PrintServerSessions()` 和 `PrintRemoteClients()` 对空列表返回空字符串。
+- `PrintRemoteClient(hostname)` 未找到 endpoint 时返回空字符串。
 - `PrintRemoteClient(hostname)` 的 hostname 校验和归一化规则与 `GetRemoteClient(hostname)` 完全一致。
 - Print 接口不得包含认证信息等敏感字段。
 
@@ -421,50 +426,23 @@ public string PrintRemoteClient(string hostname);
 
 ```text
 WebSocketCommunicationModule.GetStatus
-  -> endpointClients.Values.ToArray()
-  -> RemoteEndpointClient.CreateStatus(includeSubscriptions: false)
-  -> server?.CreateStatus()
-  -> subscriptionAggregator.CreateStatus()
+  -> GetRemoteClients() -> RemoteEndpointClient.GetDiagnosticStatus()
+  -> WebSocketEventServer 的计数属性
+  -> ClientSubscriptionAggregator 的计数属性
 
-WebSocketCommunicationModule.PrintStatus
-  -> FormatStatus(GetStatus())
-
-WebSocketCommunicationModule.GetRemoteClients
-  -> endpointClients.Values.ToArray()
-  -> RemoteEndpointClient.CreateStatus(includeSubscriptions: true)
-
-WebSocketCommunicationModule.PrintRemoteClients
-  -> FormatRemoteClients(GetRemoteClients())
-
-WebSocketCommunicationModule.GetRemoteClient(hostname)
-  -> NormalizeRemoteEndpoint(hostname)
-  -> endpointClients.TryGetValue(endpoint)
-  -> RemoteEndpointClient.CreateStatus(includeSubscriptions: true)
-
-WebSocketCommunicationModule.PrintRemoteClient(hostname)
-  -> FormatRemoteClient(GetRemoteClient(hostname))
+WebSocketCommunicationModule.GetRemoteClients / GetRemoteClient
+  -> RemoteEndpointClient.GetDiagnosticStatus()
 
 WebSocketCommunicationModule.GetServerSessions
-  -> server?.SnapshotSessions()
-  -> WebSocketSession.CreateStatus()
+  -> WebSocketEventServer.GetSessionStatuses()
+  -> WebSocketSession.GetDiagnosticStatus()
 
-WebSocketCommunicationModule.PrintServerSessions
-  -> FormatServerSessions(GetServerSessions())
+Print 接口基于对应的 DTO 查询结果生成文本。
 ```
 
-相关内部类型建议增加：
+内部诊断对象和计数按当前实现读取，不会为查询主动创建连接或重试订阅。公开 DTO 使用字符串状态。
 
-```csharp
-internal RemoteClientDiagnosticSnapshot CreateDiagnosticSnapshot(bool includeSubscriptions);
-internal ServerDiagnosticSnapshot CreateDiagnosticSnapshot();
-internal WebSocketServerSessionStatus CreateStatus();
-internal ClientAggregationDiagnosticSnapshot CreateDiagnosticSnapshot();
-internal ServerSubscriptionDiagnosticSnapshot CreateDiagnosticSnapshot();
-```
-
-内部 snapshot 可以保留枚举类型；最终公开 DTO 建议使用字符串状态，降低序列化和跨版本兼容风险。
-
-## 6. 各对象需要补充的诊断能力
+## 6. 各对象的诊断职责与扩展建议
 
 ### 6.1 `WebSocketCommunicationModule`
 
@@ -599,7 +577,7 @@ Status 查询不得：
 2. 所有 Get 和 Print 接口均能被 CFET2 探测为 Status。
 3. Thing 构造参数为 null 时抛出 `ArgumentNullException`。
 4. 模块未启动、已启动、已 Dispose 时均能安全查询状态。
-5. Print 接口输出非空、字段顺序稳定，且不包含认证信息。
+5. Print 接口字段顺序稳定；明细为空时允许返回空字符串，输出不包含认证信息。
 
 ### 9.2 总体状态测试
 
@@ -608,18 +586,18 @@ Status 查询不得：
 3. 一个远程客户端连接本机后，`ServerActiveSessionCount = 1`。
 4. 本机连接一个远端 endpoint 后，`RemoteClientCount = 1`。
 5. 连接进入 `Connected` 后，`RemoteConnectedClientCount = 1`。
-6. 远端连接或订阅失败后，失败计数正确且 `State = Degraded`。
+6. 远端连接或订阅失败后，失败计数正确；模块未释放且已启动时仍为 `State = Started`。
 7. Dispose 后 `State = Disposed`，所有明细查询返回空集合。
 
 ### 9.3 服务端 session 测试
 
-1. 握手期间 session 状态为 `Handshaking`。
-2. hello/helloAck 完成后状态为 `Active`。
+1. session 状态与底层 socket 状态一致，不能仅凭 `Open` 判断应用层握手成功。
+2. hello/helloAck 完成后 `HandshakeCompletedAtUtc` 有值。
 3. 收到消息后 `LastReceivedAtUtc` 更新。
 4. 同一 session 创建多个订阅后 `RemoteSubscriptionCount` 正确。
 5. session 断开后从 `serverSessions` 中移除。
 6. `RemoteAddress` 正确且不包含认证信息。
-7. `PrintServerSessions()` 能输出全部活动 session，空集合时输出 `No server sessions.`。
+7. `PrintServerSessions()` 能输出全部活动 session，空集合时返回空字符串。
 
 ### 9.4 远端客户端测试
 
@@ -631,7 +609,7 @@ Status 查询不得：
 6. 返回 DTO 后内部状态变化不会修改旧 DTO。
 7. `http://ip:port` 能按照 `port + 1` 查询对应 remote client。
 8. `ws://ip:port` 能按照原 port 查询对应 remote client。
-9. 查询不存在的 hostname 返回 null，格式错误的 hostname 抛出 `ArgumentException`。
+9. 查询不存在的 hostname 返回 null，格式错误或空白的 hostname 返回 null。
 10. `PrintRemoteClients()` 和 `PrintRemoteClient(hostname)` 输出与结构化快照一致。
 
 ### 9.5 并发与可靠性测试

@@ -1,5 +1,13 @@
 # WebSocketCommunicationModule PerformanceLevel 实现设计
 
+## 当前实现与设计建议的区别（2026-09-21）
+
+本文保留初始设计、建议目录或实施步骤。当前已实现客户端/服务端订阅聚合、Level 0/1 载荷、Revision upsert、ACK 状态处理及断线重订阅；“建议”字段和目录不一定是现有公开 API，验收条目也不代表本次已执行测试。
+
+实际入口为 `WebSocketCommunicationModule`，客户端使用 `Client/RemoteEndpointClient` 等组件，服务端使用 `Server/Subscriptions/WebSocketSubscriptionManager`；模块选项以 `Options/WebSocketCommunicationOptions.cs` 为准。`SupportedPerformanceLevels`、`AllowPerformanceLevelFallback` 是设计建议，不是当前可设置的选项。
+
+模块 `ResubscribeInterval` 默认 50 ms；CFET2APP 使用 `GlobalConfig.WebSocketResubscribeIntervalMs` 覆盖，默认 10 ms、允许 0。诊断及状态的当前语义见 [WebSocketCMThing 文档](WebSocketCMThing设计文档.md)，类型边界和失败 ACK 日志见 [README](../README.md)。
+
 ## 1. 文档目的
 
 本文定义 WebSocketCommunicationModule 对 `PerformanceLevel` 的正式语义、聚合规则、协议载荷、状态更新流程和测试要求。

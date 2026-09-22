@@ -12,7 +12,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
     {
         private readonly RemoteEndpointKey endpoint;
         private readonly WebSocketCommunicationOptions options;
-        private readonly ICfet2Logger logger;
+
         private readonly RemoteEndpointSubscriptionStore subscriptionStore;
         private readonly Action<string, string, int> connectionStatusChanged;
         private readonly CancellationTokenSource lifetimeCts = new();
@@ -25,7 +25,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private Task? reconnectTask;
         private Task? heartbeatTask;
         private Task? subscribeAckTask;
+        private DateTime? connectedAtUtc;
         private DateTime lastReceivedAtUtc;
+        private string? lastError;
         private TimeSpan effectiveHeartbeatInterval;
         private TimeSpan effectiveHeartbeatTimeout;
         private long connectionGeneration;
@@ -35,14 +37,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         public RemoteEndpointConnection(
             RemoteEndpointKey endpoint,
             WebSocketCommunicationOptions options,
-            ICfet2Logger logger,
+
             RemoteEndpointSubscriptionStore subscriptionStore,
             Action<RemoteEventMessage> remoteEventReceived,
             Action<string, string, int> connectionStatusChanged)
         {
             this.endpoint = endpoint;
             this.options = options;
-            this.logger = logger;
+
             this.subscriptionStore = subscriptionStore;
             this.connectionStatusChanged = connectionStatusChanged;
             effectiveHeartbeatInterval = options.HeartbeatInterval;
@@ -63,6 +65,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         internal TimeSpan EffectiveHeartbeatInterval => effectiveHeartbeatInterval;
 
         internal TimeSpan EffectiveHeartbeatTimeout => effectiveHeartbeatTimeout;
+
+        internal DateTime? ConnectedAtUtc => connectedAtUtc;
+
+        internal DateTime? LastReceivedAtUtc => lastReceivedAtUtc == default ? null : lastReceivedAtUtc;
+
+        internal int RetryCount => Volatile.Read(ref retryCount);
+
+        internal string? LastError => lastError;
 
         public async Task EnsureConnectedAsync()
         {
@@ -138,7 +148,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
                     if (retryCount >= maxRetryCount)
                     {
-                        logger.Warn(
+                        WebSocketLog.Logger.Warn(
                             $"WebSocket unsubscribe {masterTokenId} failed after {retryCount} retries: {ex.Message}");
                         socket.Abort();
                         HandleConnectionFailure(
@@ -195,7 +205,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     WebSocketProtocolConstants.SubProtocol,
                     StringComparison.Ordinal))
             {
-                logger.Error("WebSocket server did not accept the required subprotocol.");
+                WebSocketLog.Logger.Error("WebSocket server did not accept the required subprotocol.");
                 throw new WebSocketProtocolException("WebSocket server did not accept the required subprotocol.");
             }
 
@@ -224,7 +234,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
             if (helloAck == null)
             {
-                logger.Error($"Expected helloAck during WebSocket handshake: {helloAckJson}");
+                WebSocketLog.Logger.Error($"Expected helloAck during WebSocket handshake: {helloAckJson}");
                 throw new WebSocketProtocolException("Expected helloAck during WebSocket handshake.");
             }
 
@@ -244,6 +254,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
 
             lastReceivedAtUtc = DateTime.UtcNow;
+            connectedAtUtc = lastReceivedAtUtc;
+            lastError = null;
             effectiveHeartbeatInterval = ResolveHeartbeatInterval(
                 options.HeartbeatInterval,
                 helloAck.HeartbeatIntervalMilliseconds);
@@ -373,7 +385,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 }
                 catch (Exception ex)
                 {
-                    logger.Warn($"WebSocket message handling failed: {ex.Message}");
+                    WebSocketLog.Logger.Warn($"WebSocket message handling failed: {ex.Message}");
                 }
             }
         }
@@ -597,7 +609,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 catch (Exception ex)
                 {
                     reason = ex.Message;
-                    logger.Warn($"WebSocket reconnect failed: {ex.Message}");
+                    WebSocketLog.Logger.Warn($"WebSocket reconnect failed: {ex.Message}");
                 }
             }
         }
@@ -737,6 +749,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
             webSocket?.Dispose();
             webSocket = null;
+            connectedAtUtc = null;
+            lastError = reason;
             State = RemoteConnectionState.Disconnected;
             subscriptionStore.ResetForReconnect();
             connectionStatusChanged(ConnectionStatusEvent.Disconnected, reason, retryCount);
@@ -745,10 +759,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         private void MarkConnectionFailed(string reason)
         {
-            logger.Error($"connect {endpoint} failed! \n" +
+            WebSocketLog.Logger.Error($"connect {endpoint} failed! \n" +
                 $"please check the port is right or remote app is new app using websocketcm or enable websocket server?");
             webSocket?.Dispose();
             webSocket = null;
+            connectedAtUtc = null;
+            lastError = reason;
             if (State != RemoteConnectionState.Disposed)
             {
                 State = RemoteConnectionState.Failed;

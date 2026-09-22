@@ -32,6 +32,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Diagnostics
 
         public int RemoteSubscriptionCount { get; init; }
 
+        public int RemotePendingSubscriptionCount { get; init; }
+
         public int RemoteActiveSubscriptionCount { get; init; }
 
         public int RemoteFailedSubscriptionCount { get; init; }

@@ -1,8 +1,10 @@
 using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
+using Jtext103.CFET2.Core;
 using Jtext103.CFET2.Core.Event;
 using Jtext103.CFET2.Core.Log;
+using Jtext103.CFET2.WebSocketCommunicationModule;
 using Jtext103.CFET2.Core.Sample;
 using Jtext103.CFET2.WebSocketCommunicationModule.Options;
 using Jtext103.CFET2.WebSocketCommunicationModule.Protocol;
@@ -15,17 +17,33 @@ using NLog;
 namespace TestCode;
 
 [TestClass]
-public sealed class WebSocketServerReliabilityTests
+[DoNotParallelize]
+public sealed class WebSocketServerReliabilityTests : CFET2Host
 {
+    private ICfet2Logger previousLogger = null!;
+    [TestInitialize]
+    public void Init()
+    {
+        previousLogger = WebSocketLog.Logger;
+        KillHubIfAlive();
+        HubMaster.InjectHubToModule(this);
+    }
+
+    [TestCleanup]
+    public void Cleanup()
+    {
+        KillHubIfAlive();
+        WebSocketLog.Initialize(previousLogger);
+    }
+
     [TestMethod]
     public async Task Session_NonGracefulClientDisconnect_ShouldNotLeakExpectedWebSocketException()
     {
-        using var eventHub = new EventHub();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, Cfet2LogManager.GetLogger(""));
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket(
             [WebSocketMessageSerializer.Serialize(new HelloMessage())],
             new WebSocketException("injected non-graceful disconnect"));
-        using var session = new WebSocketSession(Cfet2LogManager.GetLogger(""),new WebSocketCommunicationOptions(), manager, socket);
+        using var session = new WebSocketSession(new WebSocketCommunicationOptions(), manager, socket);
 
         await session.RunAsync(CancellationToken.None);
     }
@@ -33,10 +51,9 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task Session_RemoteEventSendFailure_ShouldRemoveFailedRemoteSubscription()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         var tokenId = Guid.NewGuid();
         using var socket = new ScriptedWebSocket(
             [
@@ -49,12 +66,12 @@ public sealed class WebSocketServerReliabilityTests
             ],
             receiveFailure: null,
             failSendAfter: 2);
-        using var session = new WebSocketSession(logger, new WebSocketCommunicationOptions(), manager, socket);
+        using var session = new WebSocketSession( new WebSocketCommunicationOptions(), manager, socket);
         var runTask = session.RunAsync(CancellationToken.None);
 
         Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 1));
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 0));
@@ -68,18 +85,14 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task FanOut_OneSubscriberSendFailure_ShouldNotBlockHealthySubscriber()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, Cfet2LogManager.GetLogger(""));
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var failedSocket = new ScriptedWebSocket([], receiveFailure: null, failSendAfter: 0);
         using var healthySocket = new ScriptedWebSocket([], receiveFailure: null);
         using var failedSession = new WebSocketSession(
-            Cfet2LogManager.GetLogger(""),
             new WebSocketCommunicationOptions(),
             manager,
             failedSocket);
         using var healthySession = new WebSocketSession(
-            Cfet2LogManager.GetLogger(""),
             new WebSocketCommunicationOptions(),
             manager,
             healthySocket);
@@ -89,7 +102,7 @@ public sealed class WebSocketServerReliabilityTests
         manager.Subscribe(healthySession, Guid.NewGuid(), filter);
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => healthySocket.SendCount == 1));
@@ -99,13 +112,11 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task RemoteEventSerializationFailure_ShouldDropEventAndKeepSubscriptionUsable()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null);
         using var session = new WebSocketSession(
-            logger,
             new WebSocketCommunicationOptions(),
             manager,
             socket);
@@ -116,7 +127,7 @@ public sealed class WebSocketServerReliabilityTests
             new EventFilter("/thing/status", "Changed", 1, string.Empty));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg(
+        MyHub.Publish(new EventArg(
             "/thing/status",
             "Changed",
             new Status<object>(new SelfReferencingPayload())));
@@ -133,7 +144,7 @@ public sealed class WebSocketServerReliabilityTests
         Assert.IsFalse(logger.LastSerializationError.Contains("sensitive-value", StringComparison.Ordinal));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => socket.SendCount == 1));
@@ -143,19 +154,18 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task Level0RemoteEventSerializationFailure_ShouldDropEventAndKeepSubscriptionUsable()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null);
-        using var session = new WebSocketSession(logger, new WebSocketCommunicationOptions(), manager, socket);
+        using var session = new WebSocketSession( new WebSocketCommunicationOptions(), manager, socket);
         manager.Subscribe(
             session,
             Guid.NewGuid(),
             new EventFilter("/thing/status", "Changed", 0, string.Empty));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg(
+        MyHub.Publish(new EventArg(
             "/thing/status",
             "Changed",
             new Status<object>(new SelfReferencingPayload())));
@@ -166,7 +176,7 @@ public sealed class WebSocketServerReliabilityTests
         Assert.AreEqual(1, GetRemoteSubscriptionCount(manager));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => socket.SendCount == 1));
@@ -185,13 +195,11 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task OversizedRemoteEvent_ShouldDropEventAndKeepSubscriptionUsable()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null);
         using var session = new WebSocketSession(
-            logger,
             new WebSocketCommunicationOptions { MaxMessageBytes = 512 },
             manager,
             socket);
@@ -201,7 +209,7 @@ public sealed class WebSocketServerReliabilityTests
             new EventFilter("/thing/status", "Changed", 1, string.Empty));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<string>(new string('x', 2_000))));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<string>(new string('x', 2_000))));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => logger.SerializationErrorCount == 1));
@@ -209,7 +217,7 @@ public sealed class WebSocketServerReliabilityTests
         Assert.AreEqual(1, GetRemoteSubscriptionCount(manager));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => socket.SendCount == 1));
@@ -219,13 +227,11 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task RemoteEventSendCanceledBySessionDispose_ShouldNotReportNetworkFailure()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null, blockSendAfter: 0);
         using var session = new WebSocketSession(
-            logger,
             new WebSocketCommunicationOptions(),
             manager,
             socket);
@@ -235,7 +241,7 @@ public sealed class WebSocketServerReliabilityTests
             new EventFilter("/thing/status", "Changed"));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => socket.SendCount == 1));
@@ -249,20 +255,19 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task MultipleSubscribersSerializationFailure_ShouldKeepAllSubscriptionsUsable()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 2, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 2);
         using var socket1 = new ScriptedWebSocket([], receiveFailure: null);
         using var socket2 = new ScriptedWebSocket([], receiveFailure: null);
-        using var session1 = new WebSocketSession(logger, new WebSocketCommunicationOptions(), manager, socket1);
-        using var session2 = new WebSocketSession(logger, new WebSocketCommunicationOptions(), manager, socket2);
+        using var session1 = new WebSocketSession( new WebSocketCommunicationOptions(), manager, socket1);
+        using var session2 = new WebSocketSession( new WebSocketCommunicationOptions(), manager, socket2);
         var filter = new EventFilter("/thing/status", "Changed", 1, string.Empty);
         manager.Subscribe(session1, Guid.NewGuid(), filter);
         manager.Subscribe(session2, Guid.NewGuid(), filter);
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg(
+        MyHub.Publish(new EventArg(
             "/thing/status",
             "Changed",
             new Status<object>(new SelfReferencingPayload())));
@@ -274,7 +279,7 @@ public sealed class WebSocketServerReliabilityTests
         Assert.AreEqual(2, GetRemoteSubscriptionCount(manager));
 
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => socket1.SendCount == 1 && socket2.SendCount == 1));
@@ -283,14 +288,12 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task OversizedControlMessage_ShouldFaultRunAndCleanupSession()
     {
-        using var eventHub = new EventHub();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, Cfet2LogManager.GetLogger(""));
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         var hello = WebSocketMessageSerializer.Serialize(new HelloMessage());
         using var socket = new ScriptedWebSocket(
             [hello],
             receiveFailure: null);
         using var session = new WebSocketSession(
-            Cfet2LogManager.GetLogger(""),
             new WebSocketCommunicationOptions { MaxMessageBytes = Encoding.UTF8.GetByteCount(hello) },
             manager,
             socket);
@@ -305,13 +308,11 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public void OutboundMessageAtExactSizeLimit_ShouldSerializeSuccessfully()
     {
-        using var eventHub = new EventHub();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, Cfet2LogManager.GetLogger(""));
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null);
         var message = new PongMessage();
         var expectedPayload = WebSocketMessageSerializer.SerializeToUtf8Bytes(message);
         using var session = new WebSocketSession(
-            Cfet2LogManager.GetLogger(""),
             new WebSocketCommunicationOptions { MaxMessageBytes = expectedPayload.Length },
             manager,
             socket);
@@ -324,11 +325,9 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task Session_HandshakeTimeout_ShouldCloseSession()
     {
-        using var eventHub = new EventHub();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, Cfet2LogManager.GetLogger(""));
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         using var socket = new ScriptedWebSocket([], receiveFailure: null);
         using var session = new WebSocketSession(
-            Cfet2LogManager.GetLogger(""),
             new WebSocketCommunicationOptions
             {
                 ServerHandshakeTimeout = TimeSpan.FromMilliseconds(50),
@@ -344,10 +343,9 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task Session_RemoteEventSendTimeout_ShouldRemoveFailedRemoteSubscription()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
         var tokenId = Guid.NewGuid();
         using var socket = new ScriptedWebSocket(
             [
@@ -361,7 +359,6 @@ public sealed class WebSocketServerReliabilityTests
             receiveFailure: null,
             blockSendAfter: 2);
         using var session = new WebSocketSession(
-            logger,
             new WebSocketCommunicationOptions
             {
                 ServerSendTimeout = TimeSpan.FromMilliseconds(50),
@@ -372,7 +369,7 @@ public sealed class WebSocketServerReliabilityTests
 
         Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 1));
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/timeout", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/timeout", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 0));
@@ -385,10 +382,9 @@ public sealed class WebSocketServerReliabilityTests
     [TestMethod]
     public async Task FanOutOverload_ShouldLogErrorOnceWhileAtLimit()
     {
-        using var eventHub = new EventHub();
-        eventHub.Init();
         var logger = new RecordingLogger();
-        using var manager = new WebSocketSubscriptionManager(eventHub, 1, logger, 1);
+        WebSocketLog.Initialize(logger);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1, 1);
         var tokenId = Guid.NewGuid();
         using var socket = new ScriptedWebSocket(
             [
@@ -401,14 +397,14 @@ public sealed class WebSocketServerReliabilityTests
             ],
             receiveFailure: null,
             blockSendAfter: 2);
-        using var session = new WebSocketSession(logger, new WebSocketCommunicationOptions(), manager, socket);
+        using var session = new WebSocketSession( new WebSocketCommunicationOptions(), manager, socket);
         var runTask = session.RunAsync(CancellationToken.None);
 
         Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 1));
 #pragma warning disable CS0612
-        eventHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(1)));
-        eventHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(2)));
-        eventHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(3)));
+        MyHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(1)));
+        MyHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(2)));
+        MyHub.Publish(new EventArg("/thing/backlog", "Changed", new Status<int>(3)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() => logger.OverloadErrorCount == 1));
@@ -457,6 +453,17 @@ public sealed class WebSocketServerReliabilityTests
         }
 
         Assert.Fail($"Expected {typeof(TException).Name}.");
+    }
+
+    private static void KillHubIfAlive()
+    {
+        try
+        {
+            Hub.KillMaster();
+        }
+        catch
+        {
+        }
     }
 
     private static async Task<bool> WaitUntilAsync(Func<bool> predicate, int timeoutMilliseconds = 3000)

@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
 using Jtext103.CFET2.Core;
+using Jtext103.CFET2.Core.Attributes;
 using Jtext103.CFET2.Core.Event;
 using Jtext103.CFET2.Core.Sample;
 using Jtext103.CFET2.WebSocketCommunicationModule;
@@ -49,6 +50,30 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
     }
 
     [TestMethod]
+    public async Task Diagnostics_ShouldReportServerSessionAndSubscriptions()
+    {
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+
+        await SubscribeAsync(client, tokenId, "/thing/status", "Changed");
+
+        Assert.IsTrue(await WaitUntilAsync(() => module.GetStatus().ServerRemoteSubscriptionCount == 1));
+        var status = module.GetStatus();
+        var session = module.GetServerSessions().Single();
+
+        Assert.IsTrue(status.ServerStarted);
+        Assert.AreEqual(1, status.ServerActiveSessionCount);
+        Assert.AreEqual(1, status.ServerRemoteSubscriptionCount);
+        Assert.AreEqual(1, status.ServerAggregatedSubscriptionCount);
+        Assert.IsNotNull(session.HandshakeCompletedAtUtc);
+        Assert.AreEqual(1, session.RemoteSubscriptionCount);
+        Assert.IsTrue(module.PrintStatus().Contains("serverSessions=1", StringComparison.Ordinal));
+        Assert.IsTrue(module.PrintServerSessions().Contains(session.SessionId.ToString(), StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     public async Task Server_ShouldPushLocalEventToRemoteSubscriber()
     {
         var listenUri = CreateListenUri();
@@ -58,7 +83,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         await SubscribeAsync(client, tokenId, "/thing/status", "Changed");
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
@@ -82,7 +107,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
             "ws://should-not-be-used:9999/cfet2/event/v2");
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<string>("local")));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<string>("local")));
 #pragma warning restore CS0612
 
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
@@ -102,7 +127,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         await Task.Delay(100);
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(7)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(7)));
 #pragma warning restore CS0612
 
         Assert.IsFalse(await TryReceiveEventAsync(client, TimeSpan.FromMilliseconds(300)));
@@ -124,7 +149,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         await SubscribeAsync(secondClient, Guid.NewGuid(), "/thing/status", "Changed");
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(99)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(99)));
 #pragma warning restore CS0612
 
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(secondClient);
@@ -296,7 +321,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         client.Abort();
         client.Dispose();
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612
 
         Assert.IsTrue(await WaitUntilAsync(() =>
@@ -316,7 +341,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         await SubscribeAsync(client2, Guid.NewGuid(), "/thing/status", "Changed");
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(123)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(123)));
 #pragma warning restore CS0612
 
         var event1 = await ReceiveUntilAsync<RemoteEventMessage>(client1);
@@ -341,7 +366,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 1));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(456)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(456)));
 #pragma warning restore CS0612
 
         var event1 = await ReceiveUntilAsync<RemoteEventMessage>(client1);
@@ -350,6 +375,240 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.AreEqual(token2, event2.TokenId);
         Assert.AreEqual(456, event1.EventArg!.Sample.GetVal<int>());
         Assert.AreEqual(456, event2.EventArg!.Sample.GetVal<int>());
+    }
+
+    [TestMethod]
+    public async Task Server_MultipleClientsWithConsecutiveDistinctSubscriptions_ShouldDeliverEachEventOnce()
+    {
+        const int sourceCount = 10;
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri, maxConcurrentFanOutEvents: 128);
+        using var client1 = await ConnectAndHelloAsync(listenUri);
+        using var client2 = await ConnectAndHelloAsync(listenUri);
+        using var client3 = await ConnectAndHelloAsync(listenUri);
+        var clients = new[] { client1, client2, client3 };
+        var sources = Enumerable.Range(1, sourceCount).Select(index => $"/thing/tick/{index}").ToArray();
+        var expectedTokens = new Dictionary<ClientWebSocket, HashSet<Guid>>();
+
+        foreach (var client in clients)
+        {
+            var tokens = new HashSet<Guid>();
+            foreach (var source in sources)
+            {
+                var tokenId = Guid.NewGuid();
+                tokens.Add(tokenId);
+                await SubscribeAsync(client, tokenId, source, "Changed");
+            }
+
+            expectedTokens.Add(client, tokens);
+        }
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == sourceCount));
+
+#pragma warning disable CS0612
+        foreach (var source in sources)
+        {
+            MyHub.Publish(new EventArg(source, "Changed", new Status<string>(source)));
+        }
+#pragma warning restore CS0612
+
+        foreach (var client in clients)
+        {
+            var receivedTokens = new HashSet<Guid>();
+            var receivedSources = new HashSet<string>();
+            for (var index = 0; index < sourceCount; index++)
+            {
+                var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
+                Assert.IsTrue(remoteEvent.TokenId.HasValue);
+                receivedTokens.Add(remoteEvent.TokenId.Value);
+                receivedSources.Add(remoteEvent.EventArg!.Source);
+            }
+
+            CollectionAssert.AreEquivalent(expectedTokens[client].ToArray(), receivedTokens.ToArray());
+            CollectionAssert.AreEquivalent(sources, receivedSources.ToArray());
+            Assert.AreEqual(sourceCount, receivedTokens.Count, "A client received a duplicate event token.");
+            Assert.AreEqual(sourceCount, receivedSources.Count, "A client received a duplicate event source.");
+            Assert.IsFalse(await TryReceiveEventAsync(client, TimeSpan.FromMilliseconds(300)));
+        }
+    }
+
+    [TestMethod]
+    public async Task Server_UnmarkedResourceSubscription_ShouldObserveChangedValueWithoutExplicitPublish()
+    {
+        var thing = new UnmarkedObservedThing();
+        MyHub.TryAddThing(thing, "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+
+        await SubscribeAsync(client, Guid.NewGuid(), "/thing/ObservedStatus", "changed");
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 1));
+        Assert.AreEqual(1, GetLocalSubscriptionCount());
+        Assert.IsTrue(
+            await WaitUntilAsync(() => GetObservedResourceCount() == 1),
+            "Expected remote subscription for an existing unmarked resource to start resource observation.");
+        Assert.IsInstanceOfType(
+            GetServerLocalSubscription(module, "/thing/ObservedStatus", "changed"),
+            typeof(ResourceSubscription));
+
+        thing.SetObservedStatus(10);
+
+        var remoteEvent = await TryReceiveUntilAsync<RemoteEventMessage>(client, TimeSpan.FromSeconds(2));
+        Assert.IsNotNull(
+            remoteEvent,
+            "Expected remote subscription to observe an unmarked resource change without explicit Publish.");
+        Assert.IsNotNull(remoteEvent.EventArg);
+        Assert.AreEqual("/thing/ObservedStatus", remoteEvent.EventArg.Source);
+        Assert.AreEqual("changed", remoteEvent.EventArg.EventType);
+        Assert.AreEqual(10, remoteEvent.EventArg.Sample.GetVal<int>());
+    }
+
+    [TestMethod]
+    public async Task Server_MissingResourceLikeSource_ShouldRemainPlainEventSubscription()
+    {
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+
+        await SubscribeAsync(client, tokenId, "/thing/MissingStatus", "changed");
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 1));
+        Assert.AreEqual(1, GetLocalSubscriptionCount());
+        Assert.AreEqual(0, GetObservedResourceCount());
+        Assert.IsInstanceOfType(
+            GetServerLocalSubscription(module, "/thing/MissingStatus", "changed"),
+            typeof(Token));
+
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg("/thing/MissingStatus", "changed", new Status<int>(20)));
+#pragma warning restore CS0612
+
+        var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
+        Assert.AreEqual(tokenId, remoteEvent.TokenId);
+        Assert.IsNotNull(remoteEvent.EventArg);
+        Assert.AreEqual("/thing/MissingStatus", remoteEvent.EventArg.Source);
+        Assert.AreEqual("changed", remoteEvent.EventArg.EventType);
+        Assert.AreEqual(20, remoteEvent.EventArg.Sample.GetVal<int>());
+    }
+
+    [TestMethod]
+    public async Task Server_NativeEventResourceSubscription_ShouldReceiveExplicitPublishWithoutObservation()
+    {
+        var thing = new UnmarkedObservedThing();
+        MyHub.TryAddThing(thing, "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+
+        await SubscribeAsync(client, Guid.NewGuid(), "/thing/NativeStatus", "changed");
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 1));
+        Assert.AreEqual(1, GetLocalSubscriptionCount());
+        Assert.AreEqual(0, GetObservedResourceCount());
+        Assert.IsInstanceOfType(
+            GetServerLocalSubscription(module, "/thing/NativeStatus", "changed"),
+            typeof(ResourceSubscription));
+
+        thing.SetNativeStatusWithoutPublish(10);
+        Assert.AreEqual(0, GetObservedResourceCount());
+
+        var nativeResourcePath = MyHub.FindLocalResourceWithPath("/thing/NativeStatus").Path;
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg(nativeResourcePath, "changed", new Status<int>(20)));
+#pragma warning restore CS0612
+
+        var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
+        Assert.IsNotNull(remoteEvent.EventArg);
+        Assert.AreEqual(nativeResourcePath, remoteEvent.EventArg.Source);
+        Assert.AreEqual("changed", remoteEvent.EventArg.EventType);
+        Assert.AreEqual(20, remoteEvent.EventArg.Sample.GetVal<int>());
+    }
+
+    [TestMethod]
+    public async Task Server_ResourcePathWithTrailingSegment_ShouldRemainExactEventSubscription()
+    {
+        var thing = new UnmarkedObservedThing();
+        MyHub.TryAddThing(thing, "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+        const string parentSource = "/thing/NativeStatus";
+        const string eventSource = parentSource + "/2";
+
+        await SubscribeAsync(client, tokenId, eventSource, "changed");
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 1));
+        Assert.AreEqual(1, GetLocalSubscriptionCount());
+        Assert.IsInstanceOfType(
+            GetServerLocalSubscription(module, eventSource, "changed"),
+            typeof(Token));
+
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg(parentSource, "changed", new Status<int>(10)));
+#pragma warning restore CS0612
+
+        await Task.Delay(300);
+
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg(eventSource, "changed", new Status<int>(20)));
+#pragma warning restore CS0612
+
+        var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
+        Assert.AreEqual(tokenId, remoteEvent.TokenId);
+        Assert.AreEqual(eventSource, remoteEvent.EventArg!.Source);
+        Assert.AreEqual(20, remoteEvent.EventArg.Sample.GetVal<int>());
+    }
+
+    [TestMethod]
+    public async Task Server_MethodResourceSubscription_ShouldRejectWithoutPlainEventFallback()
+    {
+        MyHub.TryAddThing(new UnmarkedObservedThing(), "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+
+        await SendAsync(client, CreateSubscribe(tokenId, "/thing/Method", "changed", 0, 0));
+        var ack = (SubscribeAckMessage)await ReceiveAsync(client);
+
+        Assert.AreEqual(tokenId, ack.TokenId);
+        Assert.IsFalse(ack.Accepted);
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 0));
+        Assert.AreEqual(0, GetLocalSubscriptionCount());
+
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg("/thing/Method", "changed", new Status<int>(30)));
+#pragma warning restore CS0612
+
+        Assert.IsFalse(await TryReceiveEventAsync(client, TimeSpan.FromMilliseconds(300)));
+    }
+
+    [TestMethod]
+    public async Task Server_UnmarkedResourceNonChangedEvent_ShouldRejectWithoutPlainEventFallback()
+    {
+        MyHub.TryAddThing(new UnmarkedObservedThing(), "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+
+        await SendAsync(client, CreateSubscribe(tokenId, "/thing/ObservedStatus", "alarm", 0, 0));
+        var ack = (SubscribeAckMessage)await ReceiveAsync(client);
+
+        Assert.AreEqual(tokenId, ack.TokenId);
+        Assert.IsFalse(ack.Accepted);
+        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(module) == 0));
+        Assert.AreEqual(0, GetLocalSubscriptionCount());
+        Assert.AreEqual(0, GetObservedResourceCount());
+
+#pragma warning disable CS0612
+        MyHub.Publish(new EventArg("/thing/ObservedStatus", "alarm", new Status<int>(40)));
+#pragma warning restore CS0612
+
+        Assert.IsFalse(await TryReceiveEventAsync(client, TimeSpan.FromMilliseconds(300)));
     }
 
     [TestMethod]
@@ -388,7 +647,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
             GetLocalSubscriptionCount() == 1));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(789)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(789)));
 #pragma warning restore CS0612
 
         Assert.IsFalse(await TryReceiveEventAsync(client1, TimeSpan.FromMilliseconds(300)));
@@ -415,7 +674,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 0));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(1)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(1)));
 #pragma warning restore CS0612
 
         Assert.IsFalse(await TryReceiveEventAsync(client1, TimeSpan.FromMilliseconds(300)));
@@ -436,14 +695,14 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 1));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/new", "Changed", new Status<int>(20)));
+        MyHub.Publish(new EventArg("/thing/new", "Changed", new Status<int>(20)));
 #pragma warning restore CS0612
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
         Assert.AreEqual(tokenId, remoteEvent.TokenId);
         Assert.AreEqual(20, remoteEvent.EventArg!.Sample.GetVal<int>());
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/old", "Changed", new Status<int>(10)));
+        MyHub.Publish(new EventArg("/thing/old", "Changed", new Status<int>(10)));
 #pragma warning restore CS0612
         Assert.IsFalse(await TryReceiveEventAsync(client, TimeSpan.FromMilliseconds(300)));
     }
@@ -471,7 +730,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.AreEqual(1, GetRemoteSubscriptionCount(module));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/old", "Changed", new Status<int>(10)));
+        MyHub.Publish(new EventArg("/thing/old", "Changed", new Status<int>(10)));
 #pragma warning restore CS0612
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
         Assert.AreEqual(10, remoteEvent.EventArg!.Sample.GetVal<int>());
@@ -491,7 +750,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 1));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(123)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(123)));
 #pragma warning restore CS0612
 
         var full = await ReceiveUntilAsync<RemoteEventMessage>(fullClient);
@@ -517,7 +776,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
 
         CollectionAssert.AreEquivalent(localTokenIdsBefore, GetLocalSubscriptionTokenIds());
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(456)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(456)));
 #pragma warning restore CS0612
         var remoteEvent = await ReceiveUntilAsync<RemoteEventMessage>(client);
         Assert.AreEqual(0, remoteEvent.EventArg!.PerformanceLevel);
@@ -597,7 +856,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 1));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(33)));
+        MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(33)));
 #pragma warning restore CS0612
 
         Assert.IsFalse(await TryReceiveEventAsync(client1, TimeSpan.FromMilliseconds(300)));
@@ -627,13 +886,13 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsTrue(await WaitUntilAsync(() => GetLocalSubscriptionCount() == 2));
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/a", "Changed", new Status<int>(100)));
+        MyHub.Publish(new EventArg("/thing/a", "Changed", new Status<int>(100)));
 #pragma warning restore CS0612
         var first = await ReceiveUntilAsync<RemoteEventMessage>(client);
         Assert.AreEqual(100, first.EventArg!.Sample.GetVal<int>());
 
 #pragma warning disable CS0612
-        MyHub.EventHub.Publish(new EventArg("/thing/b", "Changed", new Status<int>(200)));
+        MyHub.Publish(new EventArg("/thing/b", "Changed", new Status<int>(200)));
 #pragma warning restore CS0612
         var second = await ReceiveUntilAsync<RemoteEventMessage>(client);
         Assert.AreEqual(200, second.EventArg!.Sample.GetVal<int>());
@@ -656,7 +915,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         {
 #pragma warning disable CS0612
             Parallel.For(0, 1_000, index =>
-                MyHub.EventHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(index))));
+                MyHub.Publish(new EventArg("/thing/status", "Changed", new Status<int>(index))));
 #pragma warning restore CS0612
         });
         await SendAsync(client, new UnsubscribeMessage { TokenId = tokenId });
@@ -712,7 +971,8 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         int? maxMessageBytes = null,
         TimeSpan? heartbeatInterval = null,
         TimeSpan? serverIdleTimeout = null,
-        int? maxServerSessions = null)
+        int? maxServerSessions = null,
+        int? maxConcurrentFanOutEvents = null)
     {
         var module = new WebSocketCommunicationModule(new WebSocketCommunicationOptions
         {
@@ -723,6 +983,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
             HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(30),
             ServerIdleTimeout = serverIdleTimeout ?? TimeSpan.FromSeconds(120),
             MaxServerSessions = maxServerSessions ?? 1024,
+            MaxConcurrentFanOutEvents = maxConcurrentFanOutEvents ?? Math.Max(1, Environment.ProcessorCount),
         });
 
         MyHub.TryAddCommunicationModule(module);
@@ -832,6 +1093,35 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         throw new InvalidOperationException();
     }
 
+    private static async Task<T?> TryReceiveUntilAsync<T>(ClientWebSocket client, TimeSpan timeout)
+        where T : WebSocketMessageEnvelope
+    {
+        var started = DateTime.UtcNow;
+        while (DateTime.UtcNow - started < timeout)
+        {
+            var remaining = timeout - (DateTime.UtcNow - started);
+            if (remaining <= TimeSpan.Zero)
+            {
+                return null;
+            }
+
+            try
+            {
+                var message = await ReceiveAsync(client, (int)Math.Max(1, remaining.TotalMilliseconds));
+                if (message is T typed)
+                {
+                    return typed;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
     private static async Task<bool> TryReceiveEventAsync(ClientWebSocket client, TimeSpan timeout)
     {
         using var cts = new CancellationTokenSource(timeout);
@@ -863,6 +1153,17 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         return dict.Keys.Cast<Guid>().ToArray();
     }
 
+    private int GetObservedResourceCount()
+    {
+        var managerField = typeof(EventHub).GetField("resourceObservationManager", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(managerField);
+        var manager = managerField.GetValue(MyHub.EventHub);
+        Assert.IsNotNull(manager);
+        var countProperty = manager.GetType().GetProperty("ObservedResourceCount", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(countProperty);
+        return (int)countProperty.GetValue(manager)!;
+    }
+
     private static int GetServerSessionCount(WebSocketCommunicationModule module)
     {
         var serverField = typeof(WebSocketCommunicationModule).GetField("server", BindingFlags.Instance | BindingFlags.NonPublic);
@@ -889,6 +1190,46 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.IsNotNull(remoteIndexField);
         var remoteIndex = remoteIndexField.GetValue(manager)!;
         return (int)remoteIndex.GetType().GetProperty("Count")!.GetValue(remoteIndex)!;
+    }
+
+    private static object GetServerLocalSubscription(
+        WebSocketCommunicationModule module,
+        string source,
+        string eventType)
+    {
+        var serverField = typeof(WebSocketCommunicationModule).GetField("server", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(serverField);
+        var server = serverField.GetValue(module);
+        Assert.IsNotNull(server);
+        var managerField = server.GetType().GetField("subscriptionManager", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(managerField);
+        var manager = managerField.GetValue(server);
+        Assert.IsNotNull(manager);
+        var aggregatedField = manager.GetType().GetField("aggregatedSubscriptions", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.IsNotNull(aggregatedField);
+        var aggregated = (System.Collections.IEnumerable)aggregatedField.GetValue(manager)!;
+
+        foreach (var item in aggregated)
+        {
+            var key = item.GetType().GetProperty("Key")!.GetValue(item)!;
+            var value = item.GetType().GetProperty("Value")!.GetValue(item)!;
+            var keySource = (string)key.GetType().GetProperty("Source")!.GetValue(key)!;
+            var keyEventType = (string)key.GetType().GetProperty("EventType")!.GetValue(key)!;
+            if (!string.Equals(keySource, source, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(keyEventType, eventType, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var localSubscription = value.GetType()
+                .GetProperty("LocalSubscription")!
+                .GetValue(value);
+            Assert.IsNotNull(localSubscription);
+            return localSubscription;
+        }
+
+        Assert.Fail($"Server local subscription not found: {source} {eventType}");
+        throw new InvalidOperationException();
     }
 
     private static async Task<bool> WaitUntilAsync(Func<bool> predicate, int timeoutMilliseconds = 3000)
@@ -953,6 +1294,63 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
             Hub.KillMaster();
         }
         catch
+        {
+        }
+    }
+
+    [TestMethod]
+    public async Task Server_ComplexResource_ShouldRejectObservationButAllowNativeEvents()
+    {
+        MyHub.TryAddThing(new UnmarkedObservedThing(), "/", "thing");
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        var tokenId = Guid.NewGuid();
+        await SendAsync(client, CreateSubscribe(tokenId, "/thing/ArrayStatus", "changed", 0, 0));
+        var ack = await ReceiveUntilAsync<SubscribeAckMessage>(client);
+        Assert.IsFalse(ack.Accepted);
+        StringAssert.Contains(ack.Reason!, "/thing/ArrayStatus");
+        StringAssert.Contains(ack.Reason!, "System.Int32[]");
+        StringAssert.Contains(ack.Reason!, "Cfet2Event");
+        Assert.AreEqual(0, GetRemoteSubscriptionCount(module));
+        Assert.AreEqual(0, GetLocalSubscriptionCount());
+        Assert.AreEqual(0, GetObservedResourceCount());
+
+        await SubscribeAsync(client, tokenId, "/thing/NativeArray", "changed");
+        Assert.AreEqual(0, GetObservedResourceCount());
+        MyHub.PublishResource("/thing/NativeArray", new[] { 7, 8 });
+        var message = await ReceiveUntilAsync<RemoteEventMessage>(client);
+        Assert.AreEqual(tokenId, message.TokenId);
+        CollectionAssert.AreEqual(new[] { 7, 8 }, message.EventArg!.Sample.GetVal<int[]>());
+    }
+
+    private sealed class UnmarkedObservedThing : Thing
+    {
+        [Cfet2Status]
+        public int[] ArrayStatus => new[] { 1 };
+
+        [Cfet2Status, Cfet2Event]
+        public int[] NativeArray => new[] { 1 };
+
+        [Cfet2Status]
+        public int ObservedStatus { get; private set; } = 1;
+
+        [Cfet2Status]
+        [Cfet2Event]
+        public int NativeStatus { get; private set; } = 1;
+
+        public void SetObservedStatus(int value)
+        {
+            ObservedStatus = value;
+        }
+
+        public void SetNativeStatusWithoutPublish(int value)
+        {
+            NativeStatus = value;
+        }
+
+        [Cfet2Method]
+        public void Method()
         {
         }
     }

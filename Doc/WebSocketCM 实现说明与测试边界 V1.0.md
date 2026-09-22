@@ -206,8 +206,15 @@ V1.0 不复用旧的裸 `EventRequest` 顶层消息。所有消息必须有 enve
 
 - 校验 `protocol/version/messageType/tokenId/filter`。
 - 将远程 filter 转成本地 filter，服务端本地订阅时必须清空 `filter.Host`。
-- 通过本地 `MyHub.EventHub.Subscribe(localFilter, pushToRemote)` 建立本地订阅。
-- 按 `sessionId + tokenId` 保存本地订阅 token。
+- 通过服务端 `Hub` 建立本地订阅，不直接持有或直接操作 `EventHub`。
+- 服务端优先尝试 `Hub.SubscribeResource(source, pushToRemote, eventType)`：
+  - source 能解析为本地 Status/Config 资源时，保存 `ResourceSubscription`。
+  - 资源带 `[Cfet2Event]` 时，不启动 Core 内部观测，只等待 Thing 主动发布。
+  - 资源未带 `[Cfet2Event]` 时，Core 启动内部观测，发现变化后发布 `changed`。
+  - source 不存在时，回退为普通事件订阅 `Hub.Subscribe(localFilter, pushToRemote)`。
+  - source 存在但不是可订阅资源，或未标记资源订阅非 `changed` 事件时，拒绝订阅，不回退普通事件。
+- 按 `sessionId + tokenId` 保存远端订阅关系。
+- 聚合项保存实际本地订阅对象；释放时统一 `Dispose()`，该对象可能是 `ResourceSubscription`，也可能是普通 `Token`。
 - 返回 `subscribeAck`。
 
 ### 6.2 SubscribeAck
@@ -620,7 +627,12 @@ V1.0 QoS 声明：
 
 - WebSocket 可以完成远程 Subscribe。
 - Subscribe 消息包含 `messageType/protocol/version/tokenId/filter`。
-- 服务端收到 Subscribe 后在本地 EventHub 建立订阅。
+- 服务端收到普通事件 Subscribe 后通过 `Hub.Subscribe(...)` 建立本地订阅。
+- 服务端收到存在的资源 source 后通过 `Hub.SubscribeResource(...)` 建立 `ResourceSubscription`。
+- 服务端收到不存在的资源形态 source 时，不应错误解析为资源，应回退为普通事件订阅。
+- 服务端收到存在但不可资源订阅的 source 时，应拒绝订阅，不应回退普通事件。
+- `[Cfet2Event]` 资源订阅后不启动内部观测，Thing 主动发布后能收到事件。
+- 未标记 `[Cfet2Event]` 的资源订阅后启动内部观测，只改值不主动发布也能收到 `changed`。
 - 客户端收到 `subscribeAck.accepted = true` 后订阅状态为 Active。
 - Subscribe 被拒绝时保留订阅条目，状态为 Failed，并记录 LastError。
 - SubscribeAck 超时后使用同一 MasterToken 重试；重试耗尽时中止连接并进入重连。
@@ -704,6 +716,8 @@ V1.0 QoS 声明：
 - 仍有订阅时进入 `Reconnecting`。
 - 重连成功后产生 `Connected` 状态事件。
 - 重连成功后重发所有仍存在的 Subscribe。
+- 资源形态 source 的远程订阅在断线重连后仍会重发 Subscribe，订阅数不重复增加，重连后继续收到事件。
+- 断线期间服务端尝试发送的事件不做补偿；重连后新事件应正常到达。
 - 重连后多个订阅会逐条发送，相邻 Subscribe 之间存在可配置间隔。
 - 重连期间新增 token，重连成功后会发送该 token 的 Subscribe。
 - 重连期间取消某个 token，重连成功后不会重发该 token。

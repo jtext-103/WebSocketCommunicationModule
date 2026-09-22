@@ -1,5 +1,4 @@
 <Solution>
-  <Project Path="../../../cfet2core/newcfet2core/Code/CFET2Core/CFET2Core.csproj" />
   <Project Path="../TestCode/TestCode.csproj" />
   <Project Path="WebSocketCommunicationModule.csproj" />
 </Solution>

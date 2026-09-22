@@ -135,6 +135,92 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
     }
 
     [TestMethod]
+    public async Task SendFailure_ShouldDropDisconnectedEventAndReceiveAfterReconnectWithoutDuplicatingSubscription()
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        using var module = CreateModule(reconnectPolicy: FastReconnectPolicy());
+        var token = CreateToken();
+        var receivedValues = new ConcurrentQueue<int>();
+        module.RegisterEventCallback(arg =>
+        {
+            if (arg.Source == "/thing/status")
+            {
+                receivedValues.Enqueue(arg.Sample.GetVal<int>());
+            }
+        });
+
+        module.Subscribe(token, CreateFilter(server.Endpoint));
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetSubscription(module, token.Id)?.State == SubscriptionState.Active));
+        Assert.AreEqual(1, GetOnlyConnection(module).SubscriptionCount);
+        var masterTokenId = GetMasterTokenIds(module, token.Id).Single();
+
+        await server.SimulateSendFailureAsync("/thing/status", "Changed", 111);
+
+        Assert.IsTrue(await WaitUntilAsync(() => server.AcceptedCount >= 2, 5000));
+        Assert.IsTrue(await WaitUntilAsync(() =>
+            server.SubscribeMessages.Count(message => message.TokenId == masterTokenId) >= 2,
+            5000));
+        Assert.IsTrue(await WaitUntilAsync(() =>
+            GetOnlyConnection(module).State == RemoteConnectionState.Connected &&
+            GetSubscription(module, token.Id)?.State == SubscriptionState.Active,
+            5000));
+        Assert.IsFalse(receivedValues.Contains(111));
+        Assert.AreEqual(1, GetOnlyConnection(module).SubscriptionCount);
+
+        await server.PublishAsync("/thing/status", "Changed", 222);
+
+        Assert.IsTrue(await WaitUntilAsync(() => receivedValues.Contains(222), 5000));
+        Assert.IsFalse(receivedValues.Contains(111));
+    }
+
+    [TestMethod]
+    public async Task ResourceLikeSubscriptions_ShouldReconnectResubscribeAndReceiveAfterReconnect()
+    {
+        await VerifyResourceLikeReconnectAsync("/thing/NativeStatus");
+        await VerifyResourceLikeReconnectAsync("/thing/ObservedStatus");
+    }
+
+    private async Task VerifyResourceLikeReconnectAsync(string source)
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        using var module = CreateModule(reconnectPolicy: FastReconnectPolicy());
+        var token = CreateToken();
+        var receivedValues = new ConcurrentQueue<int>();
+        module.RegisterEventCallback(arg =>
+        {
+            if (string.Equals(arg.Source, source, StringComparison.OrdinalIgnoreCase))
+            {
+                receivedValues.Enqueue(arg.Sample.GetVal<int>());
+            }
+        });
+
+        module.Subscribe(token, CreateFilter(server.Endpoint, source));
+
+        Assert.IsTrue(await WaitUntilAsync(() => GetSubscription(module, token.Id)?.State == SubscriptionState.Active));
+        Assert.AreEqual(1, GetOnlyConnection(module).SubscriptionCount);
+        var masterTokenId = GetMasterTokenIds(module, token.Id).Single();
+
+        await server.SimulateSendFailureAsync(source, "Changed", 111);
+
+        Assert.IsTrue(await WaitUntilAsync(() => server.AcceptedCount >= 2, 5000));
+        Assert.IsTrue(await WaitUntilAsync(() =>
+            server.SubscribeMessages.Count(message => message.TokenId == masterTokenId) >= 2,
+            5000));
+        Assert.IsTrue(await WaitUntilAsync(() =>
+            GetOnlyConnection(module).State == RemoteConnectionState.Connected &&
+            GetSubscription(module, token.Id)?.State == SubscriptionState.Active,
+            5000));
+        Assert.IsFalse(receivedValues.Contains(111));
+        Assert.AreEqual(1, GetOnlyConnection(module).SubscriptionCount);
+
+        await server.PublishAsync(source, "Changed", 222);
+
+        Assert.IsTrue(await WaitUntilAsync(() => receivedValues.Contains(222), 5000));
+        Assert.IsFalse(receivedValues.Contains(111));
+    }
+
+    [TestMethod]
     public async Task ReconnectAfterPerformanceLevelUpdate_ShouldSendLatestRevisionAndLevel()
     {
         using var server = Phase6Server.Start(respondToPing: true, closeFirstConnectionAfterSubscribe: true);

@@ -7,6 +7,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
     {
         public IReadOnlyList<ClientRemoteAction> Actions { get; init; } = [];
 
+        public IReadOnlyList<(RemoteEndpointKey Endpoint, Guid MasterTokenId, int Revision)> ReusedSubscriptions { get; init; } = [];
+
         public bool IsEmpty => Actions.Count == 0;
     }
 

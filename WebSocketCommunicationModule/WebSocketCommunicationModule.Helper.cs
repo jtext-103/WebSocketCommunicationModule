@@ -1,4 +1,4 @@
-﻿using Jtext103.CFET2.Core.Event;
+using Jtext103.CFET2.Core.Event;
 using Jtext103.CFET2.WebSocketCommunicationModule.Client;
 using Jtext103.CFET2.WebSocketCommunicationModule.Connections;
 using Jtext103.CFET2.WebSocketCommunicationModule.Protocol;
@@ -13,6 +13,18 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
 
         private void EnqueueClientPlan(ClientSubscriptionPlan plan)
         {
+            foreach (var reused in plan.ReusedSubscriptions)
+            {
+                if (endpointClients.TryGetValue(reused.Endpoint, out var existing))
+                {
+                    var failure = existing.GetSubscriptionFailure(reused.MasterTokenId, reused.Revision);
+                    if (failure != null)
+                    {
+                        WebSocketLog.Logger.Error(failure + " (existing failed subscription reused; no retry sent)");
+                    }
+                }
+            }
+
             if (plan.IsEmpty)
             {
                 return;
@@ -37,7 +49,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
         }
         private RemoteEndpointClient CreateRemoteEndpointClient(RemoteEndpointKey endpoint)
         {
-            var client = new RemoteEndpointClient(endpoint, options, logger);
+            var client = new RemoteEndpointClient(endpoint, options);
             client.RemoteEventReceived += OnRemoteEventReceived;
             client.ConnectionStatusChanged += OnConnectionStatusChanged;
             client.Idle += OnClientIdle;
@@ -66,7 +78,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 return;
             }
 
-            logger.Info($"Connent Status Changed {endpoint}: {eventType}");
+            WebSocketLog.Logger.Info($"Connent Status Changed {endpoint}: {eventType}");
 
             var eventArg = ConnectionStatusEvent.Create(
                 endpoint.NormalizedHost,

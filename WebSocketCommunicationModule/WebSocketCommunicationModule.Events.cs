@@ -44,7 +44,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
             catch
             {
                 // Callback failures must not stop connection or recieve-loop state machines.
-                logger.Error("Attention: EventCallback failed! the reomte event won't recieved callback!");
+                WebSocketLog.Logger.Error("Attention: EventCallback failed! the reomte event won't recieved callback!");
             }
         }
 

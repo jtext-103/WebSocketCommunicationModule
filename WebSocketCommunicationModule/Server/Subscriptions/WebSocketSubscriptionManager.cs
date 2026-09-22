@@ -1,14 +1,16 @@
 using System;
 using System.Collections.Concurrent;
+using Jtext103.CFET2.Core;
 using Jtext103.CFET2.Core.Event;
+using Jtext103.CFET2.Core.Exception;
 using Jtext103.CFET2.Core.Log;
 
 namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 {
     internal sealed partial class WebSocketSubscriptionManager : IDisposable
     {
-        private readonly EventHub eventHub;
-        private readonly ICfet2Logger logger;
+        private readonly Hub hub;
+
         private readonly ConcurrentDictionary<ServerSubscriptionKey, AggregatedServerSubscription> aggregatedSubscriptions = new();
         private readonly ConcurrentDictionary<RemoteSubscriptionKey, ServerSubscriptionKey[]> remoteIndex = new();
         private readonly object syncRoot = new();
@@ -16,17 +18,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         private readonly int maxConcurrentFanOutEvents;
         private int activeFanOutEventCount;
         private int overloadWarningActive;
+        private long overloadDropCount;
+        private long lastOverloadLogTimestamp;
         private bool disposed;
 
         public WebSocketSubscriptionManager(
-            EventHub eventHub,
+            Hub hub,
             int maxFanOutConcurrency,
-            ICfet2Logger logger,
+
             int? maxConcurrentFanOutEvents = null)
         {
-            this.eventHub = eventHub ?? throw new ArgumentNullException(nameof(eventHub));
+            this.hub = hub ?? throw new ArgumentNullException(nameof(hub));
             this.maxFanOutConcurrency = Math.Max(1, maxFanOutConcurrency);
-            this.logger = logger ?? throw new ArgumentNullException(nameof(logger));
+
             this.maxConcurrentFanOutEvents = Math.Max(
                 1,
                 maxConcurrentFanOutEvents ?? Math.Max(1, Environment.ProcessorCount));
@@ -132,12 +136,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                                 LocalFilter = localFilter,
                             };
 
-#pragma warning disable CS0612
-                            aggregated.LocalToken = eventHub.Subscribe(
-                                localFilter,
-                                eventArg => _ = ObserveFanOutAsync(key, eventArg));
-#pragma warning restore CS0612
-                            logger.Info("new : add sub to eventhub");
+                            SubscribeLocal(key, aggregated);
+                            WebSocketLog.Logger.Info("new : add sub to eventhub");
                             aggregatedSubscriptions[key] = aggregated;
                             createdSubscriptions.Add((key, aggregated));
                         }
@@ -152,7 +152,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                         if (created.Aggregated.Subscribers.IsEmpty)
                         {
                             aggregatedSubscriptions.TryRemove(created.Key, out _);
-                            UnsubscribeLocalToken(created.Aggregated.LocalToken);
+                            UnsubscribeLocal(created.Aggregated);
                         }
                     }
 
@@ -225,7 +225,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 
                 foreach (var aggregated in aggregatedSubscriptions.Values)
                 {
-                    UnsubscribeLocalToken(aggregated.LocalToken);
+                    UnsubscribeLocal(aggregated);
                 }
 
                 aggregatedSubscriptions.Clear();
@@ -289,7 +289,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 }
 
                 aggregatedSubscriptions.TryRemove(key, out _);
-                UnsubscribeLocalToken(aggregated.LocalToken);
+                UnsubscribeLocal(aggregated);
             }
         }
 
@@ -317,7 +317,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                     }
                     catch (Exception ex)
                     {
-                        logger.Error(
+                        WebSocketLog.Logger.Error(
                             $"WebSocket fan-out failed for subscriber " +
                             $"{subscriber.SessionId}/{subscriber.RemoteTokenId}: {ex}");
                     }
@@ -330,11 +330,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             if (activeCount > maxConcurrentFanOutEvents)
             {
                 Interlocked.Decrement(ref activeFanOutEventCount);
-                if (Interlocked.CompareExchange(ref overloadWarningActive, 1, 0) == 0)
+                var dropped = Interlocked.Increment(ref overloadDropCount);
+                if (ShouldLogOverload(dropped))
                 {
-                    logger.Error(
+                    WebSocketLog.Logger.Error(
                         $"WebSocket fan-out overload: event dropped, " +
-                        $"active={activeCount - 1}, limit={maxConcurrentFanOutEvents}.");
+                        $"active={activeCount - 1}, limit={maxConcurrentFanOutEvents}, " +
+                        $"droppedTotal={dropped}.");
                 }
 
                 return;
@@ -346,7 +348,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             }
             catch (Exception ex)
             {
-                logger.Error(
+                WebSocketLog.Logger.Error(
                     $"WebSocket fan-out failed for {key}: {ex}");
             }
             finally
@@ -359,18 +361,96 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             }
         }
 
-        private void UnsubscribeLocalToken(Token? localToken)
+        internal int RemoteSubscriptionCount
         {
-            if (localToken == null)
+            get
+            {
+                lock (syncRoot)
+                {
+                    return remoteIndex.Count;
+                }
+            }
+        }
+
+        internal int AggregatedSubscriptionCount
+        {
+            get
+            {
+                lock (syncRoot)
+                {
+                    return aggregatedSubscriptions.Count;
+                }
+            }
+        }
+
+        internal int ActiveFanOutEventCount => Math.Max(0, Volatile.Read(ref activeFanOutEventCount));
+
+        private bool ShouldLogOverload(long dropped)
+        {
+            if (Interlocked.CompareExchange(ref overloadWarningActive, 1, 0) == 0)
+            {
+                Interlocked.Exchange(ref lastOverloadLogTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+                return true;
+            }
+
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            var last = Interlocked.Read(ref lastOverloadLogTimestamp);
+            var elapsedMs = (now - last) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (elapsedMs < 1000)
+            {
+                return false;
+            }
+
+            return Interlocked.CompareExchange(ref lastOverloadLogTimestamp, now, last) == last;
+        }
+
+        private void SubscribeLocal(ServerSubscriptionKey key, AggregatedServerSubscription aggregated)
+        {
+            if (IsExactLocalResourcePath(key.Source))
+            {
+                var resourceSubscription = hub.SubscribeResource(
+                    key.Source,
+                    eventArg => _ = ObserveFanOutAsync(key, eventArg),
+                    key.EventType);
+
+                aggregated.LocalToken = resourceSubscription.Token;
+                aggregated.LocalSubscription = resourceSubscription;
+                return;
+            }
+
+            var token = hub.Subscribe(
+                aggregated.LocalFilter,
+                eventArg => _ = ObserveFanOutAsync(key, eventArg));
+            aggregated.LocalToken = token;
+            aggregated.LocalSubscription = token;
+        }
+
+        private bool IsExactLocalResourcePath(string source)
+        {
+            try
+            {
+                var resource = hub.FindLocalResourceWithPath(source);
+                return resource != null && string.Equals(
+                    resource.Path,
+                    source,
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch (ResourceDoesNotExistException)
+            {
+                return false;
+            }
+        }
+
+        private void UnsubscribeLocal(AggregatedServerSubscription aggregated)
+        {
+            if (aggregated.LocalSubscription == null)
             {
                 return;
             }
 
             try
             {
-#pragma warning disable CS0612
-                eventHub.Unsubscribe(localToken);
-#pragma warning restore CS0612
+                aggregated.LocalSubscription.Dispose();
             }
             catch
             {

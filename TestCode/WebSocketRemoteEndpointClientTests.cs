@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Jtext103.CFET2.Core.Event;
 using Jtext103.CFET2.Core.Log;
+using Jtext103.CFET2.WebSocketCommunicationModule;
 using Jtext103.CFET2.WebSocketCommunicationModule.Client;
 using Jtext103.CFET2.WebSocketCommunicationModule.Connections;
 using Jtext103.CFET2.WebSocketCommunicationModule.Options;
@@ -10,8 +11,16 @@ using System.Net.WebSockets;
 namespace TestCode;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class WebSocketRemoteEndpointClientTests
 {
+    private ICfet2Logger previousLogger = null!;
+
+    [TestInitialize]
+    public void SaveLogger() => previousLogger = WebSocketLog.Logger;
+
+    [TestCleanup]
+    public void RestoreLogger() => WebSocketLog.Initialize(previousLogger);
     [TestMethod]
     public void ReconnectPolicy_ShouldUseFastRetriesThenExponentialBackoffUntilMax()
     {
@@ -263,7 +272,6 @@ public sealed class WebSocketRemoteEndpointClientTests
         using var store = new DisposableSubscriptionStore(
             new RemoteEndpointSubscriptionStore(RemoteEndpointKey.Parse("ws://127.0.0.1:1/cfet2/event/v2")));
         using var processor = new RemoteEndpointActionProcessor(
-            new NullLogger(),
             () => false,
             (tokenId, _) =>
             {
@@ -351,10 +359,10 @@ public sealed class WebSocketRemoteEndpointClientTests
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var logger = new QueueRecordingLogger();
+        WebSocketLog.Initialize(logger);
         var endpoint = RemoteEndpointKey.Parse("ws://127.0.0.1:1/cfet2/event/v2");
         using var store = new DisposableSubscriptionStore(new RemoteEndpointSubscriptionStore(endpoint));
         using var processor = new RemoteEndpointActionProcessor(
-            logger,
             () => false,
             (_, _) => { },
             _ => true,
@@ -404,8 +412,7 @@ public sealed class WebSocketRemoteEndpointClientTests
     {
         return new RemoteEndpointClient(
             RemoteEndpointKey.Parse("ws://127.0.0.1:1/cfet2/event/v2"),
-            new WebSocketCommunicationOptions(),
-            new NullLogger());
+            new WebSocketCommunicationOptions());
     }
 
     private static async Task<bool> WaitUntilAsync(Func<bool> predicate, int timeoutMilliseconds = 3000)

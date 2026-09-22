@@ -686,7 +686,14 @@ Connections/*
   - `ServerSubscriptionKey -> AggregatedServerSubscription`
   - `RemoteSubscriptionKey -> ServerSubscriptionKey[]`
 - 多个远端 subscriber 订阅同一服务端 key 时共用一个本地 EventHub token。
-- 本地 EventHub 事件触发后 fan out 到所有远端 subscriber。
+- 本地事件触发后 fan out 到所有远端 subscriber。
+- 服务端订阅入口持有 `Hub`，不直接持有 `EventHub`。
+- 收到远端订阅后先尝试 `Hub.SubscribeResource(...)`：
+  - 如果 source 能解析成本地 Status/Config 资源，则建立 `ResourceSubscription`。
+  - 如果资源带 `[Cfet2Event]`，只等待 Thing 主动发布事件，不启动 Core 内部观测。
+  - 如果资源未带 `[Cfet2Event]`，由 Core 建立内部观测，变化后发布 `changed`。
+  - 如果 source 不存在，则回退为普通事件订阅 `Hub.Subscribe(...)`。
+  - 如果 source 存在但不是可订阅资源，或未标记资源订阅非 `changed` 事件，则拒绝订阅，不回退普通事件。
 - 支持单 token 退订、session 全量退订和 dispose 清理。
 - 使用 `maxFanOutConcurrency` 限制并发推送。
 
@@ -699,6 +706,7 @@ Connections/*
 
 - fan out 回调中如果 session 发送失败，当前主要依赖 session 内部吞掉异常。
 - 复杂状态由两个字典维护，需要继续保持所有增删路径的一致性。
+- 资源订阅和普通事件订阅共用聚合结构，`LocalSubscription` 可能是 `ResourceSubscription` 或普通 `Token`，后续维护时不能假设只有 EventHub token。
 
 建议：
 
@@ -712,7 +720,8 @@ Connections/*
 当前功能：
 
 - 表示服务端侧一个聚合后的本地 EventHub 订阅。
-- 保存本地 token、本地 filter 和远端 subscriber 集合。
+- 保存本地 token、本地 filter、远端 subscriber 集合，以及实际用于释放的 `LocalSubscription`。
+- `LocalSubscription` 可能是资源订阅 `ResourceSubscription`，也可能是普通事件订阅 `Token`。退订或 session 清理时统一 `Dispose()`。
 
 职责评价：
 

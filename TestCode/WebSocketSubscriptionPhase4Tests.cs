@@ -1,6 +1,10 @@
 using System.Collections.Concurrent;
 using Jtext103.CFET2.Core;
 using Jtext103.CFET2.Core.Event;
+using Jtext103.CFET2.Core.Log;
+using NLog;
+using NLog.Config;
+using NLog.Targets;
 using Jtext103.CFET2.WebSocketCommunicationModule;
 using Jtext103.CFET2.WebSocketCommunicationModule.Client;
 using Jtext103.CFET2.WebSocketCommunicationModule.Connections;
@@ -28,6 +32,42 @@ public sealed class WebSocketSubscriptionPhase4Tests : CFET2Host
     public void Cleanup()
     {
         KillHubIfAlive();
+    }
+
+    [TestMethod]
+    public async Task SubscribeAgainToFailedGroup_ShouldLogEachCallWithoutSendingAgain()
+    {
+        var previousLogger = WebSocketLog.Logger;
+        var target = new MemoryTarget { Layout = "${message}" };
+        var config = new LoggingConfiguration();
+        config.AddRule(LogLevel.Error, LogLevel.Fatal, target);
+        using var factory = new LogFactory(config);
+        try
+        {
+            using var server = SubscriptionServer.Start(tokenId => new SubscribeAckMessage
+            {
+                TokenId = tokenId, Accepted = false, Reason = "unsupported observation type"
+            });
+            using var module = CreateModule();
+            WebSocketLog.Initialize(new Cfet2Logger(factory.GetLogger("WebSocket")));
+            var first = CreateToken();
+            module.Subscribe(first, CreateFilter(server.Endpoint));
+            Assert.IsTrue(await WaitUntilAsync(() => GetSubscription(module, first.Id)?.State == SubscriptionState.Failed));
+            Assert.IsTrue(await WaitUntilAsync(() => target.Logs.Count == 1));
+            module.Subscribe(CreateToken(), CreateFilter(server.Endpoint));
+            module.Subscribe(first, CreateFilter(server.Endpoint));
+            Assert.HasCount(3, target.Logs);
+            StringAssert.Contains(target.Logs[1], "/thing/status");
+            StringAssert.Contains(target.Logs[1], "unsupported observation type");
+            StringAssert.Contains(target.Logs[2], "no retry sent");
+            await Task.Delay(150);
+            Assert.HasCount(1, server.SubscribeMessages);
+            Assert.AreEqual(SubscriptionState.Failed, GetSubscription(module, first.Id)!.State);
+        }
+        finally
+        {
+            WebSocketLog.Initialize(previousLogger);
+        }
     }
 
     [TestMethod]
@@ -101,6 +141,36 @@ public sealed class WebSocketSubscriptionPhase4Tests : CFET2Host
             GetMasterTokenIds(module, token1.Id).Concat(GetMasterTokenIds(module, token2.Id)).ToArray(),
             server.SubscribeMessages.Select(message => message.TokenId).ToArray());
         Assert.AreEqual(1, server.AcceptedCount);
+    }
+
+    [TestMethod]
+    public async Task ConsecutiveSubscriptionsBeforeConnectionIsActive_ShouldActivateEverySubscription()
+    {
+        const int subscriptionCount = 10;
+        using var server = SubscriptionServer.Start(tokenId => new SubscribeAckMessage
+        {
+            TokenId = tokenId,
+            Accepted = true,
+        });
+        using var module = CreateModule();
+        var tokens = Enumerable.Range(1, subscriptionCount)
+            .Select(_ => CreateToken())
+            .ToArray();
+
+        for (var index = 0; index < subscriptionCount; index++)
+        {
+            module.Subscribe(tokens[index], CreateFilter(server.Endpoint, "/thing/tick/" + (index + 1)));
+        }
+
+        Assert.IsTrue(await WaitUntilAsync(() => server.SubscribeMessages.Count == subscriptionCount));
+        Assert.IsTrue(await WaitUntilAsync(() => tokens.All(token =>
+            GetSubscription(module, token.Id)?.State == SubscriptionState.Active)));
+        Assert.AreEqual(1, server.AcceptedCount);
+        CollectionAssert.AreEquivalent(
+            Enumerable.Range(1, subscriptionCount).Select(index => "/thing/tick/" + index).ToArray(),
+            server.SubscribeMessages
+                .Select(message => message.Filter!.SourcesAndTypes.Single().Source)
+                .ToArray());
     }
 
     [TestMethod]

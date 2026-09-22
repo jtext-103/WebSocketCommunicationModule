@@ -17,26 +17,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         public RemoteEndpointClient(
             RemoteEndpointKey endpoint,
-            WebSocketCommunicationOptions options,
-            ICfet2Logger logger)
+            WebSocketCommunicationOptions options)
         {
             Endpoint = endpoint;
             this.options = options ?? throw new ArgumentNullException(nameof(options));
-            if (logger == null)
-            {
-                throw new ArgumentNullException(nameof(logger));
-            }
 
             subscriptionStore = new RemoteEndpointSubscriptionStore(endpoint);
             connection = new RemoteEndpointConnection(
                 endpoint,
                 this.options,
-                logger,
                 subscriptionStore,
                 RaiseRemoteEventReceived,
                 RaiseConnectionStatusChanged);
             actionProcessor = new RemoteEndpointActionProcessor(
-                logger,
                 () => disposed,
                 (tokenId, revision, filter) => AddOrUpdateSubscription(tokenId, revision, filter),
                 RemoveSubscription,
@@ -103,6 +96,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             return subscriptionStore.Get(masterTokenId);
         }
+
+        public string? GetSubscriptionFailure(Guid masterTokenId, int revision) =>
+            subscriptionStore.GetSubscriptionFailure(masterTokenId, revision);
 
         public IReadOnlyList<RemoteSubscriptionEntry> SnapshotSubscriptions()
         {

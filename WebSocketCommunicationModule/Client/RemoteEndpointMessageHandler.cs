@@ -1,4 +1,5 @@
 using Jtext103.CFET2.WebSocketCommunicationModule.Protocol;
+using Jtext103.CFET2.Core.Log;
 using System.Net.WebSockets;
 
 namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
@@ -13,6 +14,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private readonly Action<RemoteEventMessage> remoteEventReceived;
         private readonly Func<bool> isDisposed;
         private readonly Action<Exception> connectionFailure;
+
 
         public RemoteEndpointMessageHandler(
             RemoteEndpointSubscriptionStore subscriptionStore,
@@ -32,6 +34,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             this.remoteEventReceived = remoteEventReceived;
             this.isDisposed = isDisposed;
             this.connectionFailure = connectionFailure;
+
         }
 
         public void HandleIncomingMessage(
@@ -42,7 +45,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             switch (message)
             {
                 case SubscribeAckMessage subscribeAck:
-                    subscriptionStore.MarkSubscribeAck(subscribeAck);
+                    var failure = subscriptionStore.MarkSubscribeAck(subscribeAck);
+                    if (failure != null)
+                    {
+                        WebSocketLog.Logger.Error(failure);
+                    }
                     break;
                 case RemoteEventMessage remoteEvent:
                     HandleRemoteEvent(remoteEvent);

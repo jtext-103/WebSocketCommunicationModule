@@ -227,18 +227,20 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
         }
 
-        public void MarkSubscribeAck(SubscribeAckMessage message)
+        // Return a diagnostic only for the first rejection of the current attempt.
+        // The caller logs outside syncRoot so logging callbacks cannot run under the store lock.
+        public string? MarkSubscribeAck(SubscribeAckMessage message)
         {
             lock (syncRoot)
             {
                 if (!subscriptions.TryGetValue(message.TokenId, out var entry))
                 {
-                    return;
+                    return null;
                 }
 
                 if (message.Revision != entry.Revision)
                 {
-                    return;
+                    return null;
                 }
 
                 if (message.Accepted)
@@ -249,15 +251,41 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     entry.LastError = null;
                     entry.SubscribeSentAtUtc = null;
                     entry.SubscribeSendInProgress = false;
-                    return;
+                    return null;
                 }
 
+                var alreadyFailed = entry.State == SubscriptionState.Failed;
                 entry.State = SubscriptionState.Failed;
                 entry.SubscribeSendInProgress = false;
                 entry.LastError = string.IsNullOrWhiteSpace(message.Reason)
                     ? "Subscribe rejected."
                     : message.Reason;
+                if (alreadyFailed)
+                {
+                    return null;
+                }
+
+                return FormatSubscriptionFailure(entry);
             }
+        }
+
+        public string? GetSubscriptionFailure(Guid tokenId, int revision)
+        {
+            lock (syncRoot)
+            {
+                return subscriptions.TryGetValue(tokenId, out var entry) &&
+                    entry.Revision == revision && entry.State == SubscriptionState.Failed
+                    ? FormatSubscriptionFailure(entry) : null;
+            }
+        }
+
+        private string FormatSubscriptionFailure(RemoteSubscriptionEntry entry)
+        {
+            var resources = string.Join(", ", entry.Filter.SourcesAndTypes.Select(item =>
+                $"{item.Source} ({item.EventType})"));
+            return $"WebSocket subscription failed: endpoint={endpoint.ToUri()}, " +
+                $"resources=[{resources}], token={entry.TokenId}, revision={entry.Revision}, " +
+                $"reason={entry.LastError}";
         }
 
         public void MarkError(ErrorMessage message)

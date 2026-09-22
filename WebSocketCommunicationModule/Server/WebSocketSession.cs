@@ -12,26 +12,32 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 {
     public sealed partial class WebSocketSession : IDisposable
     {
-        private ICfet2Logger logger;
+
         private readonly WebSocketCommunicationOptions options;
         private readonly WebSocketSubscriptionManager subscriptionManager;
         private readonly WebSocket socket;
+        private readonly string? remoteAddress;
         private readonly ConcurrentDictionary<Guid, byte> remoteTokens = new();
         private readonly SemaphoreSlim sendLock = new(1, 1);
         private readonly CancellationTokenSource cts = new();
         private readonly object lifecycleLock = new();
+        private readonly DateTime createdAtUtc = DateTime.UtcNow;
+        private DateTime? handshakeCompletedAtUtc;
+        private DateTime lastReceivedAtUtc;
         private int disposed;
 
         internal WebSocketSession(
-            ICfet2Logger logger,
+
             WebSocketCommunicationOptions options,
             WebSocketSubscriptionManager subscriptionManager,
-            WebSocket socket)
+            WebSocket socket,
+            string? remoteAddress = null)
         {
-            this.logger = logger;
+
             this.options = options;
             this.subscriptionManager = subscriptionManager;
             this.socket = socket;
+            this.remoteAddress = remoteAddress;
         }
 
         public Guid Id { get; } = Guid.NewGuid();
@@ -127,7 +133,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 options.ServerHandshakeTimeout);
             var json = await ReceiveTextMessageAsync(handshakeCts.Token).ConfigureAwait(false);
             var hello = WebSocketMessageSerializer.DeserializeMessage(json) as HelloMessage;
-            logger.Info($"accept hello: {hello == null} {hello?.ClientId}");
+            WebSocketLog.Logger.Info($"accept hello: {hello == null} {hello?.ClientId}");
             if (hello == null)
             {
                 await SendAsync(new ErrorMessage
@@ -144,6 +150,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 HeartbeatIntervalMilliseconds = (int)options.HeartbeatInterval.TotalMilliseconds,
                 HeartbeatTimeoutMilliseconds = (int)options.ServerIdleTimeout.TotalMilliseconds,
             }, cancellationToken).ConfigureAwait(false);
+            handshakeCompletedAtUtc = DateTime.UtcNow;
         }
 
         private async Task SubscribeAsync(SubscribeMessage message, CancellationToken cancellationToken)
@@ -239,7 +246,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             }
             catch (Exception ex) when (IsRecoverableSerializationException(ex))
             {
-                logger.Error(
+                WebSocketLog.Logger.Error(
                     $"Remote event serialization failed: session={Id}, token={remoteTokenId}, " +
                     $"performanceLevel={performanceLevel}, source={eventArg.Source}, " +
                     $"eventType={eventArg.EventType}, error={ex}");
@@ -256,7 +263,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             }
             catch (Exception ex)
             {
-                logger.Error(
+                WebSocketLog.Logger.Error(
                     $"Remote event network send failed: session={Id}, token={remoteTokenId}, " +
                     $"performanceLevel={performanceLevel}, source={eventArg.Source}, " +
                     $"eventType={eventArg.EventType}, error={ex}");
@@ -352,6 +359,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             }
             while (!result.EndOfMessage);
 
+            lastReceivedAtUtc = DateTime.UtcNow;
             return System.Text.Encoding.UTF8.GetString(stream.ToArray());
         }
 

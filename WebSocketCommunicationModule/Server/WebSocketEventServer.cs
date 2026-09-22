@@ -1,4 +1,4 @@
-using Jtext103.CFET2.Core.Event;
+using Jtext103.CFET2.Core;
 using Jtext103.CFET2.Core.Log;
 using Jtext103.CFET2.WebSocketCommunicationModule.Options;
 using Jtext103.CFET2.WebSocketCommunicationModule.Protocol;
@@ -18,24 +18,23 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 {
     public sealed partial class WebSocketEventServer : IDisposable
     {
-        private ICfet2Logger logger;
+
         private readonly WebSocketCommunicationOptions options;
-        private readonly EventHub eventHub;
+        private readonly Hub hub;
         private readonly WebSocketSubscriptionManager subscriptionManager;
         private readonly ConcurrentDictionary<Guid, WebSocketSession> sessions = new();
         private readonly CancellationTokenSource cts = new();
         private int admittedSessionCount;
         private WebApplication? app;
 
-        public WebSocketEventServer(ICfet2Logger logger, WebSocketCommunicationOptions options, EventHub eventHub)
+        public WebSocketEventServer(WebSocketCommunicationOptions options, Hub hub)
         {
-            this.logger = logger;
+
             this.options = options ?? throw new ArgumentNullException(nameof(options));
-            this.eventHub = eventHub ?? throw new ArgumentNullException(nameof(eventHub));
+            this.hub = hub ?? throw new ArgumentNullException(nameof(hub));
             subscriptionManager = new WebSocketSubscriptionManager(
-                eventHub,
+                hub,
                 options.MaxFanOutConcurrency,
-                logger,
                 options.MaxConcurrentFanOutEvents);
         }
 
@@ -193,7 +192,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 return;
             }
 
-            var session = new WebSocketSession(logger,options, subscriptionManager, webSocket);
+            var remoteAddress = context.Connection.RemoteIpAddress == null
+                ? null
+                : $"{context.Connection.RemoteIpAddress}:{context.Connection.RemotePort}";
+            var session = new WebSocketSession( options, subscriptionManager, webSocket, remoteAddress);
             sessions[session.Id] = session;
             try
             {

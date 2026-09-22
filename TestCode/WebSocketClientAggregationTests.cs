@@ -53,6 +53,32 @@ public sealed class WebSocketClientAggregationTests : CFET2Host
     }
 
     [TestMethod]
+    public async Task Diagnostics_ShouldReportRemoteSubscriptionReadiness()
+    {
+        using var server = AggregationServer.Start();
+        using var module = CreateModule();
+        var token = CreateToken();
+
+        module.Subscribe(token, CreateFilter(server.Endpoint, "/thing/status"));
+
+        Assert.IsTrue(await WaitUntilAsync(() => module.GetStatus().RemoteActiveSubscriptionCount == 1));
+        var status = module.GetStatus();
+        var client = module.GetRemoteClient(server.Endpoint);
+
+        Assert.AreEqual(1, status.RemoteClientCount);
+        Assert.AreEqual(1, status.RemoteSubscriptionCount);
+        Assert.AreEqual(0, status.RemotePendingSubscriptionCount);
+        Assert.AreEqual(1, status.RemoteActiveSubscriptionCount);
+        Assert.AreEqual(1, status.ClientAggregationGroupCount);
+        Assert.AreEqual(1, status.LocalSubscriptionCount);
+        Assert.IsNotNull(client);
+        Assert.AreEqual("Connected", client.State);
+        Assert.AreEqual("/thing/status", client.Subscriptions.Single().Source);
+        Assert.IsTrue(module.PrintStatus().Contains("remoteActive=1", StringComparison.Ordinal));
+        Assert.IsTrue(module.PrintRemoteClient(server.Endpoint).Contains("active=1", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     public async Task MultiRuleFilter_ShouldSplitIntoOneRemoteSubscribePerRule()
     {
         using var server = AggregationServer.Start();

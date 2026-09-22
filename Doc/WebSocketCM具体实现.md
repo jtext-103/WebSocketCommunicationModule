@@ -1,5 +1,13 @@
 # WebSocketCM 具体实现
 
+## 当前实现与设计建议的区别（2026-09-21）
+
+本文保留初始设计、建议目录或实施步骤。当前已实现客户端/服务端订阅聚合、Level 0/1 载荷、Revision upsert、ACK 状态处理及断线重订阅；“建议”字段和目录不一定是现有公开 API，验收条目也不代表本次已执行测试。
+
+实际入口为 `WebSocketCommunicationModule`，客户端使用 `Client/RemoteEndpointClient` 等组件，服务端使用 `Server/Subscriptions/WebSocketSubscriptionManager`；模块选项以 `Options/WebSocketCommunicationOptions.cs` 为准。`SupportedPerformanceLevels`、`AllowPerformanceLevelFallback` 是设计建议，不是当前可设置的选项。
+
+模块 `ResubscribeInterval` 默认 50 ms；CFET2APP 使用 `GlobalConfig.WebSocketResubscribeIntervalMs` 覆盖，默认 10 ms、允许 0。诊断及状态的当前语义见 [WebSocketCMThing 文档](WebSocketCMThing设计文档.md)，类型边界和失败 ACK 日志见 [README](../README.md)。
+
 本文档基于 `WebSocketCM 实现说明与测试边界 V1.0`，进一步拆分 `WebSocketCommunicationModule` 的具体实现类、文件结构、核心职责和第一阶段功能落地顺序。本文不替代 V1.0 规格；V1.0 仍是协议和测试边界的最终约束。
 
 ## 1. 实现目标
@@ -96,22 +104,23 @@ private volatile bool disposed;
 职责：
 
 1. 实现 `GetFullHost(protocol, hostname, port)`。
-2. 统一构造 v2 事件 endpoint。
+2. 返回 Core 使用的 Host 标识，并由连接层统一构造 v2 事件 endpoint。
 3. 封装 CFET 固定双端口映射策略：HTTP 资源端口为配置端口，WebSocket 事件端口为配置端口 + 1。
 
 建议规则：
 
 ```text
-ws   -> ws://{hostname}:{port}/cfet2/event/v2
-http -> ws://{hostname}:{port + 1}/cfet2/event/v2
+ws   -> ws://{hostname}:{port}
+http -> ws://{hostname}:{port + 1}
 其他 -> string.Empty
 ```
 
 注意：
 
-1. 返回值必须是完整 v2 endpoint，不能只返回 `ws://host:port`。
-2. 用户订阅可以写 `http://host:port/resource/path`；`EventFilter` 解析后应得到 `filter.Host = ws://host:{port + 1}/cfet2/event/v2`，`Source = /resource/path`。
-3. CFET 部署占用两个相邻端口：`http` 为资源访问端口，`ws` 为事件端口。事件通信模块只负责把 `http` 写法规范化为对应的 `ws` 事件端点。
+1. 返回值是 Core Host 标识，不包含 `/cfet2/event/v2`。
+2. 真实 WebSocket 连接 URI 由 `RemoteEndpointKey.ToUri()` 统一拼接 `/cfet2/event/v2`。
+3. 用户订阅可以写 `http://host:port/resource/path`；`EventFilter` 解析后应得到 `filter.Host = ws://host:{port + 1}`，`Source = /resource/path`。
+4. CFET 部署占用两个相邻端口：`http` 为资源访问端口，`ws` 为事件端口。事件通信模块只负责把 `http` 写法规范化为对应的 `ws` 事件 Host。
 
 ### 3.3 `WebSocketCommunicationModule.Events.cs`
 
@@ -452,7 +461,7 @@ Disconnected
 
 ## 8. 服务端核心流程
 
-服务端第一阶段可以后置，但类边界建议预留。
+服务端已采用 `WebSocketEventServer`、`WebSocketSession`、`WebSocketSubscriptionManager` 三层结构。
 
 ### 8.1 `WebSocketEventServer`
 
@@ -474,9 +483,9 @@ Disconnected
 职责：
 
 1. 完成 hello/helloAck。
-2. 维护 `sessionId + tokenId -> ServerSubscriptionEntry`。
+2. 维护当前 session 的远端 token 集合。
 3. 收到 `subscribe` 后把远程 filter 转为本地 filter，并清空 `Host`。
-4. 调用 `MyHub.EventHub.Subscribe(localFilter, pushToRemote)`。
+4. 调用 `WebSocketSubscriptionManager` 建立聚合订阅。
 5. 收到 `unsubscribe` 后只取消指定 token。
 6. 本地事件触发后发送 `event` envelope。
 7. session 关闭时取消全部本地订阅。
@@ -489,7 +498,17 @@ Disconnected
 1. 复制 `SourcesAndTypes`。
 2. 清空 `Host`。
 3. 保留 `PerformanceLevel`。
-4. 本地订阅 token 只保存在服务端 session 内，不暴露给远程客户端。
+4. 服务端聚合项按 `source + eventType` 复用本地订阅，不暴露给远程客户端。
+5. 聚合项保存实际释放对象，可能是 `ResourceSubscription`，也可能是普通 `Token`。
+
+服务端建立本地订阅时不再直接持有 `EventHub`，而是持有 `Hub`：
+
+1. 先尝试 `Hub.SubscribeResource(source, pushToRemote, eventType)`。
+2. 如果 source 能解析成本地 Status/Config 资源，则建立 `ResourceSubscription`。
+3. 带 `[Cfet2Event]` 的资源不进入 Core 内部观测，只接收 Thing 主动发布。
+4. 未带 `[Cfet2Event]` 的资源进入 Core 内部观测，变化后发布 `changed`。
+5. 如果 source 不存在，则回退为普通事件订阅 `Hub.Subscribe(localFilter, pushToRemote)`。
+6. 如果 source 存在但不是可订阅资源，或未标记资源订阅非 `changed` 事件，则拒绝订阅，不回退普通事件。
 
 ## 9. 状态事件设计
 

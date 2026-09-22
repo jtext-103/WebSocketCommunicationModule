@@ -49,11 +49,17 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 }
 
                 var masterTokenIds = new List<Guid>(groupKeys.Length);
+                var reusedSubscriptions = new List<(RemoteEndpointKey Endpoint, Guid MasterTokenId, int Revision)>();
                 foreach (var groupKey in groupKeys)
                 {
                     var group = GetOrCreateClientSubscriptionGroup(groupKey, filter, actions);
                     AddOrUpdateLocalSubscription(group, token.Id, filter.PerformanceLevel, actions);
                     masterTokenIds.Add(group.MasterTokenId);
+                    if (!actions.Any(action => action.Kind == RemoteEndpointActionKind.Subscribe &&
+                        action.MasterTokenId == group.MasterTokenId))
+                    {
+                        reusedSubscriptions.Add((group.Endpoint, group.MasterTokenId, group.Revision));
+                    }
                 }
 
                 localSubscriptionIndex[token.Id] = new LocalSubscriptionBinding
@@ -66,7 +72,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
                 return new ClientSubscriptionPlan
                 {
-                    Actions = actions
+                    Actions = actions,
+                    ReusedSubscriptions = reusedSubscriptions,
                 };
             }
         }
@@ -99,6 +106,28 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             lock (syncRoot)
             {
                 return clientSubscriptionGroups.Values.Any(group => group.Endpoint.Equals(endpoint) && !group.LocalTokenIds.IsEmpty);
+            }
+        }
+
+        internal int GroupCount
+        {
+            get
+            {
+                lock (syncRoot)
+                {
+                    return clientSubscriptionGroups.Count;
+                }
+            }
+        }
+
+        internal int LocalSubscriptionCount
+        {
+            get
+            {
+                lock (syncRoot)
+                {
+                    return localSubscriptionIndex.Count;
+                }
             }
         }
 
