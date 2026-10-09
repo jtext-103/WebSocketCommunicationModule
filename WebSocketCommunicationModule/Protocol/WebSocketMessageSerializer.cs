@@ -114,6 +114,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
                 if (obj.Value<int?>("performanceLevel") == 1)
                 {
                     var valueToken = obj["value"];
+                    var timestamp = ReadTimestamp(obj["timestamp"]);
                     return new RemoteEventMessage
                     {
                         TokenId = ReadNullableGuid(obj["tokenId"]),
@@ -121,12 +122,16 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
                         Source = obj.Value<string>("source") ?? string.Empty,
                         EventType = obj.Value<string>("eventType") ?? string.Empty,
                         Value = valueToken?.ToObject<object>(JsonSerializer),
+                        Timestamp = timestamp,
                         EventArg = new EventArg
                         {
                             PerformanceLevel = 1,
                             Source = obj.Value<string>("source") ?? string.Empty,
                             EventType = obj.Value<string>("eventType") ?? string.Empty,
-                            Sample = new Status<object>(valueToken?.ToObject<object>(JsonSerializer)!),
+                            Sample = new Status<object>(valueToken?.ToObject<object>(JsonSerializer)!)
+                            {
+                                Timestamp = timestamp,
+                            },
                         },
                     };
                 }
@@ -193,11 +198,23 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
                 var objectValueToken = sampleObj["objectVal"] ?? sampleObj["val"];
                 if (objectValueToken != null)
                 {
-                    return new Status<object>(objectValueToken.ToObject<object>(JsonSerializer)!);
+                    return new Status<object>(objectValueToken.ToObject<object>(JsonSerializer)!)
+                    {
+                        Timestamp = ReadTimestamp(sampleObj["timestamp"]),
+                    };
                 }
             }
 
             return new Status<object>(sampleToken.ToObject<object>(JsonSerializer)!);
+        }
+
+        private static DateTimeOffset? ReadTimestamp(JToken? token)
+        {
+            // Reuse the sample policy, including legacy/malformed values remaining unknown.
+            var sample = new SampleBase<object>();
+            if (token is JValue value && value.Value != null)
+                sample.Context[SampleBase<object>.KeyOfTimestamp] = value.Value;
+            return sample.Timestamp;
         }
 
         private static JObject ParseAndValidateEnvelope(string json)

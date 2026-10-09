@@ -759,6 +759,8 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.AreEqual(1, lightweight.EventArg!.PerformanceLevel);
         Assert.AreEqual(123, full.EventArg.Sample.GetVal<int>());
         Assert.AreEqual(123L, lightweight.EventArg.Sample.GetVal<long>());
+        Assert.IsNotNull(full.EventArg.Sample.Timestamp);
+        Assert.AreEqual(full.EventArg.Sample.Timestamp, lightweight.EventArg.Sample.Timestamp);
     }
 
     [TestMethod]

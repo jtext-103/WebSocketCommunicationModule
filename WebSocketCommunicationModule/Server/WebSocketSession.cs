@@ -240,6 +240,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                     Source = performanceLevel == 1 ? eventArg.Source : null,
                     EventType = performanceLevel == 1 ? eventArg.EventType : null,
                     Value = performanceLevel == 1 ? eventArg.Sample?.ObjectVal : null,
+                    Timestamp = performanceLevel == 1 ? eventArg.Sample?.Timestamp : null,
                     EventArg = performanceLevel == 0 ? CreateFullRemoteEvent(eventArg) : null,
                 };
                 payload = SerializeMessage(message);

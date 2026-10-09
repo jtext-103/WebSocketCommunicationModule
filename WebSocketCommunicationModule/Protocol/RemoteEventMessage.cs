@@ -20,6 +20,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
 
         public object? Value { get; init; }
 
+        /// <summary>Source change time for a lightweight event; absent in legacy messages.</summary>
+        public DateTimeOffset? Timestamp { get; init; }
+
         public EventArg? EventArg { get; init; }
     }
 }

@@ -32,9 +32,10 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
     [TestMethod]
     public async Task RemoteEventMessage_ShouldRaiseRegisteredCallbackWithNormalizedHostAndRemoteSample()
     {
+        var sourceTime = new DateTimeOffset(2026, 9, 24, 1, 2, 3, TimeSpan.Zero);
         using var server = EventPushServer.Start((tokenId, endpoint) => new RemoteEventMessage
         {
-            EventArg = new EventArg("/thing/status", "Changed", new Status<int>(123)),
+            EventArg = new EventArg("/thing/status", "Changed", new Status<int>(123) { Timestamp = sourceTime }),
         });
         using var module = CreateModule();
         var receivedEvents = new List<EventArg>();
@@ -55,6 +56,7 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         Assert.AreEqual("Changed", received.EventType);
         Assert.IsTrue(received.Sample.IsRemote);
         Assert.AreEqual(123, received.Sample.GetVal<int>());
+        Assert.AreEqual(sourceTime, received.Sample.Timestamp);
     }
 
     [TestMethod]
@@ -87,6 +89,7 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         Assert.IsTrue(received.Sample.IsRemote);
         Assert.AreEqual(321L, received.Sample.GetVal<long>());
         Assert.IsFalse(received.Sample.Context.ContainsKey("serverOnlyContext"));
+        Assert.IsNull(received.Sample.Timestamp);
     }
 
     [TestMethod]
