@@ -49,6 +49,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Options
 
         public int MaxConcurrentFanOutEvents { get; set; } = Math.Max(1, Environment.ProcessorCount);
 
+        /// <summary>Maximum waiting event/group dispatch tasks, excluding active consumers. Must be positive.</summary>
+        public int MaxPendingFanOutEvents { get; set; } = 256;
+
         public int MaxServerSessions { get; set; } = 1024;
 
         public int ActionQueueWarningThreshold { get; set; } = 1000;

@@ -37,7 +37,6 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         public RemoteEndpointConnection(
             RemoteEndpointKey endpoint,
             WebSocketCommunicationOptions options,
-
             RemoteEndpointSubscriptionStore subscriptionStore,
             Action<RemoteEventMessage> remoteEventReceived,
             Action<string, string, int> connectionStatusChanged)

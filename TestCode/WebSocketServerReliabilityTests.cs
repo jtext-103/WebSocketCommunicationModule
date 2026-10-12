@@ -380,11 +380,11 @@ public sealed class WebSocketServerReliabilityTests : CFET2Host
     }
 
     [TestMethod]
-    public async Task FanOutOverload_ShouldLogErrorOnceWhileAtLimit()
+    public async Task FanOutOverload_ShouldLogErrorOnceWhenQueueIsFull()
     {
         var logger = new RecordingLogger();
         WebSocketLog.Initialize(logger);
-        using var manager = new WebSocketSubscriptionManager(MyHub, 1, 1);
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1, 1, maxPendingFanOutEvents: 1);
         var tokenId = Guid.NewGuid();
         using var socket = new ScriptedWebSocket(
             [

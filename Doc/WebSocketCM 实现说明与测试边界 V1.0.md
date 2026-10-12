@@ -493,10 +493,27 @@ V1.0 QoS 声明：
 
 - 服务端通过 `MaxFanOutConcurrency` 限制单次 fan-out 的发送并发度，并通过 `MaxConcurrentFanOutEvents` 限制同时执行的 fan-out 事件数量。
 - 当前实现不为每个 session 建立独立的有界发送队列，也不主动识别、隔离或断开慢客户端。
-- 慢客户端、网络阻塞或大事件发送可能长时间占用全局 fan-out 执行额度。达到 `MaxConcurrentFanOutEvents` 后，新触发的事件允许直接丢弃。
-- 进入过载状态时记录 `WebSocket fan-out overload` 错误日志；过载持续期间避免重复刷屏，退出过载状态后允许再次记录。
-- 当前策略只提供过载告警，不保证慢客户端与健康客户端之间的事件隔离，也不保证被丢弃事件的补发或重放。
+- 慢客户端、网络阻塞或大事件发送可能长时间占用全局 fan-out 执行额度。服务端固定消费者数为 `MaxConcurrentFanOutEvents`，另有 `MaxPendingFanOutEvents` 个等待位置（默认 256，必须大于 0）；等待队列满时丢弃新任务。一个任务表示一个事件向一个聚合订阅组分发。
+- 满队列时逐次增加 `FanOutQueueFullDropCount`，`WebSocket fan-out overload` 告警最多每秒一次。等待数降至容量一半或以下输出恢复摘要，短暂恢复不重置告警限频；关闭时补记未报告的丢弃数量。半容量仅是告警恢复阈值，有空位立即接受新任务。
+- 当前策略提供有界等待、固定分发并发及丢弃诊断，不保证慢客户端与健康客户端之间的事件隔离，也不保证被丢弃事件的补发或重放。Core 的队列与回调调度保持原行为。
 - 运维侧应监控该日志。持续出现时，应排查慢客户端、网络状态、事件大小和发布频率，并根据资源情况调整 fan-out 配置。
+
+队列配置示例（设置在模块启动之前）：
+
+```csharp
+var options = new WebSocketCommunicationOptions
+{
+    MaxConcurrentFanOutEvents = 4, // 固定分发消费者
+    MaxPendingFanOutEvents = 256,  // 等待任务容量，不含活动任务
+    MaxFanOutConcurrency = 8,      // 每个任务内的接收者发送并发
+};
+```
+
+`GetStatus()` / `PrintStatus()` 暴露等待数、活动数、容量、并发数、等待峰值、累计满队列丢弃数及关闭弃置数。`FanOutShutdownDiscardCount` 仅统计关闭时仍在等待队列中的任务，不与满队列丢弃混用，也不代表客户端通知数量。消息已成功进入 Core 队列不代表已投递到远端。
+
+排队项捕获入队时接收者，发送前和取得会话发送锁后验证订阅实例；退订、revision 更新和聚合组重建使旧目标失效。固定消费者不保证端到端发送顺序。未启动、启动失败和重复释放均清理消费者；关闭放弃等待项，消费者合计最多等待 5 秒，超时后延迟清理仍在使用的资源。
+
+详见 [WebSocket 有界事件分发队列修改方案](WebSocket有界事件分发队列修改方案.md)。
 
 ### 9.2 客户端 endpoint 动作队列
 
@@ -544,7 +561,7 @@ V1.0 QoS 声明：
 - 服务端也应实现 ping/pong 或响应客户端 ping。
 - 服务端通过 `MaxServerSessions`、`ServerHandshakeTimeout`、`ServerIdleTimeout` 和 `ServerSendTimeout` 限制 session 数量及网络操作耗时。
 - 单个 session 发送失败或超时后，终止该 session 并清理其全部订阅。
-- fan-out 通过 `MaxFanOutConcurrency` 和 `MaxConcurrentFanOutEvents` 限制并发；达到全局上限时允许丢弃新事件并记录告警。
+- fan-out 通过 `MaxFanOutConcurrency` 和 `MaxConcurrentFanOutEvents` 限制并发；等待任务达到 `MaxPendingFanOutEvents` 后丢弃新任务并计数、限频告警。
 
 服务端不得假设一个连接只有一个订阅。
 
@@ -763,7 +780,7 @@ V1.0 QoS 声明：
 - 当前消息 DTO 不包含 `cursor` 字段，也不启用补偿逻辑。
 - 重连后重订阅按单条 Subscribe 顺序发送，且相邻发送之间有可配置间隔。
 - SendAsync 超时不会导致全局死锁。
-- fan-out 达到 `MaxConcurrentFanOutEvents` 时允许丢弃事件，并记录一次 `WebSocket fan-out overload` 告警；不要求慢客户端与健康客户端隔离。
+- fan-out 等待队列达到 `MaxPendingFanOutEvents` 时丢弃新任务并累计计数，`WebSocket fan-out overload` 告警每秒最多一次；不要求慢客户端与健康客户端隔离。
 - 目标行为：接收到超大 JSON 报文时完整 drain 并丢弃该条消息，连接继续工作。当前实现仍可能关闭连接，此测试待实现后调整。
 - 目标行为：握手后的非法 JSON 或错误协议消息只记录警告并忽略。当前实现仍可能关闭连接或 session，此测试待实现后调整。
 - 服务端返回 error 时客户端订阅状态和连接状态一致。

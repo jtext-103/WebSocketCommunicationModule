@@ -17,9 +17,6 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         private readonly int maxFanOutConcurrency;
         private readonly int maxConcurrentFanOutEvents;
         private int activeFanOutEventCount;
-        private int overloadWarningActive;
-        private long overloadDropCount;
-        private long lastOverloadLogTimestamp;
         private bool disposed;
 
         private sealed class Preparation
@@ -45,7 +42,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         private int runningPreparations, pendingRequests;
 
         public WebSocketSubscriptionManager(Hub hub, int maxFanOutConcurrency,
-            int? maxConcurrentFanOutEvents = null, int maxConcurrentPreparations = 4, int maxPendingPreparations = 256)
+            int? maxConcurrentFanOutEvents = null, int maxConcurrentPreparations = 4, int maxPendingPreparations = 256, int maxPendingFanOutEvents = 256)
         {
             this.hub = hub ?? throw new ArgumentNullException(nameof(hub));
             this.maxFanOutConcurrency = Math.Max(1, maxFanOutConcurrency);
@@ -54,6 +51,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             if (maxPendingPreparations < 0) throw new ArgumentOutOfRangeException(nameof(maxPendingPreparations));
             maxPreparations = maxConcurrentPreparations;
             maxPending = maxPendingPreparations;
+            InitializeFanOut(maxPendingFanOutEvents);
         }
 
         // Reservation is synchronous so receive order is preserved. Device reads only run in workers.
@@ -242,8 +240,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             {
                 if (disposed) return;
                 disposed = true;
+                CloseFanOutQueue();
                 foreach (var key in requests.Keys.ToArray()) UnsubscribeCore(key, cleanup);
             }
+            StopFanOut();
             DisposeGroups(cleanup);
         }
         internal bool IsCurrent(Guid sessionId, Guid tokenId, Task<ServerSubscribeResult> task)
@@ -259,76 +259,6 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 .OrderBy(s => s, StringComparer.Ordinal).Select(s => s.Length + ":" + s));
         private void DisposeGroups(IEnumerable<AggregatedServerSubscription> groups)
         { foreach (var group in groups.Distinct()) UnsubscribeLocal(group); }
-
-        private async Task FanOutAsync(AggregatedServerSubscription aggregated, EventArg eventArg)
-        {
-            if (!aggregated.IsActive)
-            {
-                return;
-            }
-
-            var subscribers = aggregated.Subscribers.Values.ToArray();
-            await Parallel.ForEachAsync(
-                subscribers,
-                new ParallelOptions { MaxDegreeOfParallelism = maxFanOutConcurrency },
-                async (subscriber, _) =>
-                {
-                    try
-                    {
-                        var remoteKey = new RemoteSubscriptionKey(subscriber.SessionId, subscriber.RemoteTokenId);
-                        if (!aggregated.IsActive || !aggregated.Subscribers.TryGetValue(remoteKey, out var current) || !ReferenceEquals(current, subscriber)) return;
-                        await subscriber.Session
-                            .SendRemoteEventAsync(
-                                subscriber.RemoteTokenId,
-                                eventArg,
-                                subscriber.PerformanceLevel)
-                            .ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        WebSocketLog.Logger.Error(
-                            $"WebSocket fan-out failed for subscriber " +
-                            $"{subscriber.SessionId}/{subscriber.RemoteTokenId}: {ex}");
-                    }
-                }).ConfigureAwait(false);
-        }
-
-        private async Task ObserveFanOutAsync(AggregatedServerSubscription aggregated, EventArg eventArg)
-        {
-            var activeCount = Interlocked.Increment(ref activeFanOutEventCount);
-            if (activeCount > maxConcurrentFanOutEvents)
-            {
-                Interlocked.Decrement(ref activeFanOutEventCount);
-                var dropped = Interlocked.Increment(ref overloadDropCount);
-                if (ShouldLogOverload(dropped))
-                {
-                    WebSocketLog.Logger.Error(
-                        $"WebSocket fan-out overload: event dropped, " +
-                        $"active={activeCount - 1}, limit={maxConcurrentFanOutEvents}, " +
-                        $"droppedTotal={dropped}.");
-                }
-
-                return;
-            }
-
-            try
-            {
-                await FanOutAsync(aggregated, eventArg).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                WebSocketLog.Logger.Error(
-                    $"WebSocket fan-out failed: {ex}");
-            }
-            finally
-            {
-                activeCount = Interlocked.Decrement(ref activeFanOutEventCount);
-                if (activeCount < maxConcurrentFanOutEvents)
-                {
-                    Interlocked.Exchange(ref overloadWarningActive, 0);
-                }
-            }
-        }
 
         internal int RemoteSubscriptionCount
         {
@@ -354,32 +284,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 
         internal int ActiveFanOutEventCount => Math.Max(0, Volatile.Read(ref activeFanOutEventCount));
 
-        private bool ShouldLogOverload(long dropped)
-        {
-            if (Interlocked.CompareExchange(ref overloadWarningActive, 1, 0) == 0)
-            {
-                Interlocked.Exchange(ref lastOverloadLogTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
-                return true;
-            }
-
-            var now = System.Diagnostics.Stopwatch.GetTimestamp();
-            var last = Interlocked.Read(ref lastOverloadLogTimestamp);
-            var elapsedMs = (now - last) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (elapsedMs < 1000)
-            {
-                return false;
-            }
-
-            return Interlocked.CompareExchange(ref lastOverloadLogTimestamp, now, last) == last;
-        }
-
         private void SubscribeLocal(ServerSubscriptionKey key, AggregatedServerSubscription aggregated)
         {
             if (IsExactLocalResourcePath(key.Source))
             {
                 var resourceSubscription = hub.SubscribeResource(
                     key.Source,
-                    eventArg => _ = ObserveFanOutAsync(aggregated, eventArg),
+                    eventArg => TryEnqueueFanOut(aggregated, eventArg),
                     key.EventType);
 
                 aggregated.LocalToken = resourceSubscription.Token;
@@ -389,7 +300,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 
             var subscription = hub.SubscribeResources(
                 aggregated.LocalFilter,
-                eventArg => _ = ObserveFanOutAsync(aggregated, eventArg));
+                eventArg => TryEnqueueFanOut(aggregated, eventArg));
             aggregated.LocalToken = subscription.Token;
             aggregated.LocalSubscription = subscription;
         }

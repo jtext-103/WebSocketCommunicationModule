@@ -220,8 +220,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             return SendRemoteEventAsync(remoteTokenId, eventArg, 0);
         }
 
-        internal async Task SendRemoteEventAsync(Guid remoteTokenId, EventArg eventArg, int performanceLevel)
+        internal async Task SendRemoteEventAsync(Guid remoteTokenId, EventArg eventArg, int performanceLevel,
+            CancellationToken cancellationToken = default, Func<bool>? isValid = null)
         {
+            if (cancellationToken.IsCancellationRequested || (isValid != null && !isValid())) return;
             if (Volatile.Read(ref disposed) != 0 || socket.State != WebSocketState.Open)
             {
                 return;
@@ -253,9 +255,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 
             try
             {
-                await SendPayloadAsync(payload, cts.Token).ConfigureAwait(false);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, cancellationToken);
+                await SendPayloadAsync(payload, linkedCts.Token, isValid).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            catch (OperationCanceledException) when (cts.IsCancellationRequested || cancellationToken.IsCancellationRequested)
             {
                 return;
             }

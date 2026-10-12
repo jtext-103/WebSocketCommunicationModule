@@ -22,6 +22,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 ServerRemoteSubscriptionCount = currentServer?.RemoteSubscriptionCount ?? 0,
                 ServerAggregatedSubscriptionCount = currentServer?.AggregatedSubscriptionCount ?? 0,
                 ActiveFanOutEventCount = currentServer?.ActiveFanOutEventCount ?? 0,
+                PendingFanOutEventCount = currentServer?.PendingFanOutEventCount ?? 0,
+                PeakPendingFanOutEventCount = currentServer?.PeakPendingFanOutEventCount ?? 0,
+                FanOutQueueFullDropCount = currentServer?.FanOutQueueFullDropCount ?? 0,
+                FanOutShutdownDiscardCount = currentServer?.FanOutShutdownDiscardCount ?? 0,
+                MaxPendingFanOutEvents = currentServer?.MaxPendingFanOutEvents ?? options.MaxPendingFanOutEvents,
+                MaxConcurrentFanOutEvents = currentServer?.MaxConcurrentFanOutEvents ?? options.MaxConcurrentFanOutEvents,
                 RemoteClientCount = remoteClients.Count,
                 RemoteConnectedClientCount = remoteClients.Count(client => client.State == RemoteConnectionState.Connected.ToString()),
                 RemoteFailedClientCount = remoteClients.Count(client => client.State == RemoteConnectionState.Failed.ToString()),
@@ -41,6 +47,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                    $"serverSessions={status.ServerActiveSessionCount} " +
                    $"serverRemoteSubscriptions={status.ServerRemoteSubscriptionCount} " +
                    $"serverAggregatedSubscriptions={status.ServerAggregatedSubscriptionCount} " +
+                   $"fanOutPending={status.PendingFanOutEventCount} fanOutActive={status.ActiveFanOutEventCount} " +
+                   $"fanOutCapacity={status.MaxPendingFanOutEvents} fanOutConcurrency={status.MaxConcurrentFanOutEvents} " +
+                   $"fanOutPeak={status.PeakPendingFanOutEventCount} fanOutDropped={status.FanOutQueueFullDropCount} " +
+                   $"fanOutShutdownDiscarded={status.FanOutShutdownDiscardCount} " +
                    $"remoteClients={status.RemoteClientCount} remoteSubscriptions={status.RemoteSubscriptionCount} " +
                    $"remotePending={status.RemotePendingSubscriptionCount} " +
                    $"remoteActive={status.RemoteActiveSubscriptionCount} " +

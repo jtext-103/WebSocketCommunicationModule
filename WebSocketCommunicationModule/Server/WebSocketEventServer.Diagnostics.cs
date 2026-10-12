@@ -12,6 +12,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 
         internal int ActiveFanOutEventCount => subscriptionManager.ActiveFanOutEventCount;
 
+        internal int PendingFanOutEventCount => subscriptionManager.PendingFanOutEventCount;
+        internal int PeakPendingFanOutEventCount => subscriptionManager.PeakPendingFanOutEventCount;
+        internal long FanOutQueueFullDropCount => subscriptionManager.FanOutQueueFullDropCount;
+        internal long FanOutShutdownDiscardCount => subscriptionManager.FanOutShutdownDiscardCount;
+        internal int MaxPendingFanOutEvents => subscriptionManager.MaxPendingFanOutEvents;
+        internal int MaxConcurrentFanOutEvents => subscriptionManager.MaxConcurrentFanOutEvents;
+
         internal IReadOnlyList<WebSocketServerSessionStatus> GetSessionStatuses()
         {
             return sessions.Values

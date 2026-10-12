@@ -24,6 +24,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Diagnostics
 
         public int ActiveFanOutEventCount { get; init; }
 
+        public int PendingFanOutEventCount { get; init; }
+        public int PeakPendingFanOutEventCount { get; init; }
+        public long FanOutQueueFullDropCount { get; init; }
+        public long FanOutShutdownDiscardCount { get; init; }
+        public int MaxPendingFanOutEvents { get; init; }
+        public int MaxConcurrentFanOutEvents { get; init; }
+
         public int RemoteClientCount { get; init; }
 
         public int RemoteConnectedClientCount { get; init; }

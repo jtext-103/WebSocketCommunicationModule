@@ -25,6 +25,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
         private readonly ConcurrentDictionary<Guid, WebSocketSession> sessions = new();
         private readonly CancellationTokenSource cts = new();
         private int admittedSessionCount;
+        private int disposed;
         private WebApplication? app;
 
         public WebSocketEventServer(WebSocketCommunicationOptions options, Hub hub)
@@ -37,13 +38,15 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 options.MaxFanOutConcurrency,
                 options.MaxConcurrentFanOutEvents,
                 options.MaxConcurrentSubscriptionPreparations,
-                options.MaxPendingSubscriptionPreparations);
+                options.MaxPendingSubscriptionPreparations,
+                options.MaxPendingFanOutEvents);
         }
 
         public bool IsStarted { get; private set; }
 
         public void Start()
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
             if (IsStarted)
             {
                 return;
@@ -75,7 +78,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 
         public void Dispose()
         {
-            if (!IsStarted && app == null)
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
             {
                 return;
             }

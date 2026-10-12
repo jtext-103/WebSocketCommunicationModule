@@ -296,10 +296,12 @@ public sealed partial class WebSocketRegexSubscriptionLifecycleTests : CFET2Host
         m.Unsubscribe(s.Id, id);
         await Accepted(Subscribe(m, s, id, "/old", type: "alarm"));
         var replacement = groups.Values.Single(); Assert.AreNotSame(old, replacement); Assert.IsFalse(old.IsActive);
-        var fanOut = typeof(WebSocketSubscriptionManager).GetMethod("ObserveFanOutAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        await (Task)fanOut.Invoke(m, [old, new EventArg("/old", "alarm", new Jtext103.CFET2.Core.Sample.Status<int>(1))])!;
+        var fanOut = typeof(WebSocketSubscriptionManager).GetMethod("TryEnqueueFanOut", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        fanOut.Invoke(m, [old, new EventArg("/old", "alarm", new Jtext103.CFET2.Core.Sample.Status<int>(1))]);
         Assert.AreEqual(0, socket.SendCount);
-        await (Task)fanOut.Invoke(m, [replacement, new EventArg("/old", "alarm", new Jtext103.CFET2.Core.Sample.Status<int>(2))])!;
+        Assert.AreEqual(0, m.PendingFanOutEventCount);
+        fanOut.Invoke(m, [replacement, new EventArg("/old", "alarm", new Jtext103.CFET2.Core.Sample.Status<int>(2))]);
+        await Eventually(() => socket.SendCount == 1 && m.ActiveFanOutEventCount == 0);
         Assert.AreEqual(1, socket.SendCount);
         Assert.AreEqual(0, m.ActiveFanOutEventCount);
         replacement.LocalSubscription = new ThrowAfterDispose(replacement.LocalSubscription!);
