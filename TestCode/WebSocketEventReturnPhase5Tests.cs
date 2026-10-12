@@ -297,20 +297,47 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         }
     }
 
+    [TestMethod]
+    [DataRow(0)]
+    [DataRow(1)]
+    public async Task EventBeforeSubscribeAckIsDeliveredWhilePendingAndThenBecomesActive(int level)
+    {
+        using var server = EventPushServer.StartBeforeAck((id, _) => new RemoteEventMessage
+        {
+            TokenId = id, PerformanceLevel = level,
+            EventArg = level == 0 ? new EventArg("/thing/status", "Changed", new Status<int>(123)) : null,
+            Source = "/thing/status", EventType = "Changed", Value = 123,
+        });
+        using var module = CreateModule();
+        var received = new System.Collections.Concurrent.ConcurrentQueue<EventArg>();
+        module.RegisterEventCallback(e => { if (e.Source == "/thing/status") received.Enqueue(e); });
+        module.Subscribe(CreateToken(), CreateFilter(server.Endpoint, performanceLevel: level));
+        Assert.IsTrue(await WaitUntilAsync(() => received.Count == 1));
+        Assert.AreEqual(123, received.Single().Sample.GetVal<int>());
+        Assert.AreEqual(0, module.GetStatus().RemoteActiveSubscriptionCount);
+        Assert.AreEqual(1, module.GetStatus().RemotePendingSubscriptionCount);
+        server.AllowAck.TrySetResult();
+        Assert.IsTrue(await WaitUntilAsync(() => module.GetStatus().RemoteActiveSubscriptionCount == 1));
+        Assert.AreEqual(1, received.Count);
+    }
+
     private sealed class EventPushServer : IDisposable
     {
         private readonly CancellationTokenSource cts = new();
         private readonly Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory;
         private readonly bool closeAfterSubscribe;
+        private readonly bool beforeAck;
+        public readonly TaskCompletionSource AllowAck = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly HttpListener listener;
         private readonly List<WebSocket> sockets = new();
         private readonly object gate = new();
         private readonly Task acceptLoop;
 
-        private EventPushServer(Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory, bool closeAfterSubscribe)
+        private EventPushServer(Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory, bool closeAfterSubscribe, bool beforeAck = false)
         {
             this.eventFactory = eventFactory;
             this.closeAfterSubscribe = closeAfterSubscribe;
+            this.beforeAck = beforeAck;
             Port = GetFreePort();
             Endpoint = $"ws://127.0.0.1:{Port}/cfet2/event/v2";
             listener = new HttpListener();
@@ -332,6 +359,9 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         {
             return new EventPushServer(eventFactory, closeAfterSubscribe: false);
         }
+
+        public static EventPushServer StartBeforeAck(Func<Guid, string, WebSocketMessageEnvelope> factory)
+            => new((id, endpoint) => [factory(id, endpoint)], false, true);
 
         public static EventPushServer StartCloseAfterSubscribe()
         {
@@ -409,6 +439,12 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
 
                 var json = await ReceiveTextAsync(wsContext.WebSocket, cts.Token);
                 var subscribe = (SubscribeMessage)WebSocketMessageSerializer.DeserializeMessage(json);
+                if (beforeAck)
+                {
+                    foreach (var message in eventFactory(subscribe.TokenId, Endpoint))
+                        await SendAsync(wsContext.WebSocket, message);
+                    await AllowAck.Task.WaitAsync(cts.Token);
+                }
                 await SendAsync(wsContext.WebSocket, new SubscribeAckMessage
                 {
                     TokenId = subscribe.TokenId,
@@ -424,7 +460,7 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
                     return;
                 }
 
-                foreach (var message in eventFactory(subscribe.TokenId, Endpoint))
+                foreach (var message in beforeAck ? Array.Empty<WebSocketMessageEnvelope>() : eventFactory(subscribe.TokenId, Endpoint))
                 {
                     await SendAsync(wsContext.WebSocket, message);
                 }

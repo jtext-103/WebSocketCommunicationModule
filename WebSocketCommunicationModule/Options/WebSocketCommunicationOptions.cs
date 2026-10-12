@@ -41,6 +41,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Options
 
         public int MaxMessageBytes { get; set; } = 4 * 1024 * 1024;
 
+        public int MaxConcurrentSubscriptionPreparations { get; set; } = 4;
+
+        public int MaxPendingSubscriptionPreparations { get; set; } = 256;
+
         public int MaxFanOutConcurrency { get; set; } = Math.Max(1, Environment.ProcessorCount * 2);
 
         public int MaxConcurrentFanOutEvents { get; set; } = Math.Max(1, Environment.ProcessorCount);

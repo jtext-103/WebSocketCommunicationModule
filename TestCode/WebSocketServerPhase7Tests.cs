@@ -15,7 +15,7 @@ namespace TestCode;
 
 [TestClass]
 [DoNotParallelize]
-public sealed class WebSocketServerPhase7Tests : CFET2Host
+public sealed partial class WebSocketServerPhase7Tests : CFET2Host
 {
     [TestInitialize]
     public void Init()
@@ -479,7 +479,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.AreEqual(0, GetObservedResourceCount());
         Assert.IsInstanceOfType(
             GetServerLocalSubscription(module, "/thing/MissingStatus", "changed"),
-            typeof(Token));
+            typeof(ResourceGroupSubscription));
 
 #pragma warning disable CS0612
         MyHub.Publish(new EventArg("/thing/MissingStatus", "changed", new Status<int>(20)));
@@ -544,7 +544,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         Assert.AreEqual(1, GetLocalSubscriptionCount());
         Assert.IsInstanceOfType(
             GetServerLocalSubscription(module, eventSource, "changed"),
-            typeof(Token));
+            typeof(ResourceGroupSubscription));
 
 #pragma warning disable CS0612
         MyHub.Publish(new EventArg(parentSource, "changed", new Status<int>(10)));
@@ -974,12 +974,18 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         TimeSpan? heartbeatInterval = null,
         TimeSpan? serverIdleTimeout = null,
         int? maxServerSessions = null,
-        int? maxConcurrentFanOutEvents = null)
+        int? maxConcurrentFanOutEvents = null,
+        TimeSpan? subscribeAckTimeout = null, int maxSubscribeRetryCount = 3,
+        int maxPreparations = 4, int maxPendingPreparations = 256)
     {
         var module = new WebSocketCommunicationModule(new WebSocketCommunicationOptions
         {
             EnableServer = true,
             ListenUri = listenUri,
+            SubscribeAckTimeout = subscribeAckTimeout ?? TimeSpan.FromSeconds(10),
+            MaxSubscribeRetryCount = maxSubscribeRetryCount,
+            MaxConcurrentSubscriptionPreparations = maxPreparations,
+            MaxPendingSubscriptionPreparations = maxPendingPreparations,
             ReceiveBufferSize = 1024,
             MaxMessageBytes = maxMessageBytes ?? 4 * 1024 * 1024,
             HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(30),
@@ -1312,13 +1318,13 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
         var ack = await ReceiveUntilAsync<SubscribeAckMessage>(client);
         Assert.IsFalse(ack.Accepted);
         StringAssert.Contains(ack.Reason!, "/thing/ArrayStatus");
-        StringAssert.Contains(ack.Reason!, "System.Int32[]");
+        StringAssert.Contains(ack.Reason!, "System.Object[]");
         StringAssert.Contains(ack.Reason!, "Cfet2Event");
         Assert.AreEqual(0, GetRemoteSubscriptionCount(module));
         Assert.AreEqual(0, GetLocalSubscriptionCount());
         Assert.AreEqual(0, GetObservedResourceCount());
 
-        await SubscribeAsync(client, tokenId, "/thing/NativeArray", "changed");
+        await SubscribeAsync(client, tokenId, "/thing/NativeArray", "changed", revision: 1);
         Assert.AreEqual(0, GetObservedResourceCount());
         MyHub.PublishResource("/thing/NativeArray", new[] { 7, 8 });
         var message = await ReceiveUntilAsync<RemoteEventMessage>(client);
@@ -1329,7 +1335,7 @@ public sealed class WebSocketServerPhase7Tests : CFET2Host
     private sealed class UnmarkedObservedThing : Thing
     {
         [Cfet2Status]
-        public int[] ArrayStatus => new[] { 1 };
+        public object[] ArrayStatus => new object[] { 1 };
 
         [Cfet2Status, Cfet2Event]
         public int[] NativeArray => new[] { 1 };

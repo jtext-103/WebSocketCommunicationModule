@@ -6,6 +6,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 {
     internal sealed class AggregatedServerSubscription
     {
+        internal volatile bool IsActive = true;
+
         public Token? LocalToken { get; set; }
 
         public IDisposable? LocalSubscription { get; set; }

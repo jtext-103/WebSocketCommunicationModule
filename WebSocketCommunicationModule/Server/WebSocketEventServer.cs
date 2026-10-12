@@ -35,7 +35,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             subscriptionManager = new WebSocketSubscriptionManager(
                 hub,
                 options.MaxFanOutConcurrency,
-                options.MaxConcurrentFanOutEvents);
+                options.MaxConcurrentFanOutEvents,
+                options.MaxConcurrentSubscriptionPreparations,
+                options.MaxPendingSubscriptionPreparations);
         }
 
         public bool IsStarted { get; private set; }

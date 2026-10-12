@@ -254,12 +254,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             return filter.SourcesAndTypes
                 .Where(rule => !string.IsNullOrWhiteSpace(rule.Source) && !string.IsNullOrWhiteSpace(rule.EventType))
-                .GroupBy(rule => $"{rule.Source}\0{rule.EventType}", StringComparer.OrdinalIgnoreCase)
-                .Select(group =>
-                {
-                    var rule = group.First();
-                    return new ClientSubscriptionGroupKey(endpoint, rule.Source, rule.EventType);
-                });
+                .Select(rule => new ClientSubscriptionGroupKey(endpoint, rule.Source, rule.EventType))
+                .Distinct();
         }
 
         private static EventFilter CreateSingleRuleRemoteFilter(

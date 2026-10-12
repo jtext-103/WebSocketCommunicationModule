@@ -22,280 +22,247 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         private long lastOverloadLogTimestamp;
         private bool disposed;
 
-        public WebSocketSubscriptionManager(
-            Hub hub,
-            int maxFanOutConcurrency,
+        private sealed class Preparation
+        {
+            internal required ServerSubscriptionKey Key;
+            internal required AggregatedServerSubscription Group;
+            internal readonly HashSet<Request> Waiters = new();
+            internal LinkedListNode<Preparation>? QueueNode;
+            internal bool Running, Ready, Removed;
+        }
+        private sealed class Request
+        {
+            internal required RemoteSubscriptionKey Key;
+            internal required RemoteSubscriber Subscriber;
+            internal readonly List<Preparation> Needs = new();
+            internal readonly TaskCompletionSource<ServerSubscribeResult> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            internal bool Pending;
+        }
+        private readonly Dictionary<ServerSubscriptionKey, Preparation> preparations = new();
+        private readonly Dictionary<RemoteSubscriptionKey, Request> requests = new();
+        private readonly LinkedList<Preparation> queue = new();
+        private readonly int maxPreparations, maxPending;
+        private int runningPreparations, pendingRequests;
 
-            int? maxConcurrentFanOutEvents = null)
+        public WebSocketSubscriptionManager(Hub hub, int maxFanOutConcurrency,
+            int? maxConcurrentFanOutEvents = null, int maxConcurrentPreparations = 4, int maxPendingPreparations = 256)
         {
             this.hub = hub ?? throw new ArgumentNullException(nameof(hub));
             this.maxFanOutConcurrency = Math.Max(1, maxFanOutConcurrency);
-
-            this.maxConcurrentFanOutEvents = Math.Max(
-                1,
-                maxConcurrentFanOutEvents ?? Math.Max(1, Environment.ProcessorCount));
+            this.maxConcurrentFanOutEvents = Math.Max(1, maxConcurrentFanOutEvents ?? Math.Max(1, Environment.ProcessorCount));
+            if (maxConcurrentPreparations <= 0) throw new ArgumentOutOfRangeException(nameof(maxConcurrentPreparations));
+            if (maxPendingPreparations < 0) throw new ArgumentOutOfRangeException(nameof(maxPendingPreparations));
+            maxPreparations = maxConcurrentPreparations;
+            maxPending = maxPendingPreparations;
         }
 
-        public ServerSubscribeResult Subscribe(
-            WebSocketSession session,
-            Guid remoteTokenId,
-            int revision,
-            EventFilter remoteFilter)
+        // Reservation is synchronous so receive order is preserved. Device reads only run in workers.
+        public Task<ServerSubscribeResult> SubscribeAsync(WebSocketSession session, Guid remoteTokenId,
+            int revision, EventFilter remoteFilter)
         {
-            if (session == null)
-            {
-                throw new ArgumentNullException(nameof(session));
-            }
-
-            if (remoteFilter == null)
-            {
-                throw new ArgumentNullException(nameof(remoteFilter));
-            }
-
-            ThrowIfDisposed();
-
-            if (remoteFilter.SourcesAndTypes.Count == 0)
-            {
-                throw new ArgumentException("Filter must contain at least one source/type.", nameof(remoteFilter));
-            }
-
-            if (remoteFilter.PerformanceLevel is not 0 and not 1)
-            {
-                return new ServerSubscribeResult(
-                    revision,
-                    false,
-                    $"Unsupported PerformanceLevel: {remoteFilter.PerformanceLevel}");
-            }
-
-            var distinctSourceAndTypes = remoteFilter.SourcesAndTypes
-                .Select(item => new ServerSubscriptionKey(item.Source, item.EventType))
-                .Distinct()
-                .ToArray();
-            var filterSignature = CreateFilterSignature(distinctSourceAndTypes);
-
-            var remoteKey = new RemoteSubscriptionKey(session.Id, remoteTokenId);
-
+            ArgumentNullException.ThrowIfNull(session);
+            ArgumentNullException.ThrowIfNull(remoteFilter);
+            var keys = remoteFilter.SourcesAndTypes.Select(r => new ServerSubscriptionKey(r.Source, r.EventType)).Distinct().ToArray();
+            var signature = CreateFilterSignature(keys);
+            var key = new RemoteSubscriptionKey(session.Id, remoteTokenId);
+            var cleanup = new List<AggregatedServerSubscription>();
+            Task<ServerSubscribeResult> task;
             lock (syncRoot)
             {
                 ThrowIfDisposed();
-                if (TryGetSubscriber(remoteKey, out var existingSubscriber))
+                if (requests.TryGetValue(key, out var previous))
                 {
-                    if (revision < existingSubscriber.Revision)
+                    if (revision < previous.Subscriber.Revision) return Task.FromResult(new ServerSubscribeResult(revision, false, "staleRevision"));
+                    if (revision == previous.Subscriber.Revision)
+                        return previous.Subscriber.FilterSignature == signature && previous.Subscriber.PerformanceLevel == remoteFilter.PerformanceLevel
+                            ? previous.Completion.Task : Task.FromResult(new ServerSubscribeResult(revision, false, "revisionConflict"));
+                    // Keep shared reservations until the replacement has acquired them. In particular,
+                    // a performance-only update must not restart an in-flight initial read.
+                    foreach (var prep in previous.Needs.Where(p => !keys.Contains(p.Key)).ToArray())
                     {
-                        return new ServerSubscribeResult(revision, false, "staleRevision");
-                    }
-
-                    if (revision == existingSubscriber.Revision)
-                    {
-                        if (existingSubscriber.FilterSignature == filterSignature &&
-                            existingSubscriber.PerformanceLevel == remoteFilter.PerformanceLevel)
-                        {
-                            return new ServerSubscribeResult(
-                                revision,
-                                existingSubscriber.LastAccepted,
-                                existingSubscriber.LastReason);
-                        }
-
-                        return new ServerSubscribeResult(revision, false, "revisionConflict");
-                    }
-
-                    if (existingSubscriber.FilterSignature == filterSignature)
-                    {
-                        existingSubscriber.PerformanceLevel = remoteFilter.PerformanceLevel;
-                        existingSubscriber.Revision = revision;
-                        existingSubscriber.LastAccepted = true;
-                        existingSubscriber.LastReason = null;
-                        return new ServerSubscribeResult(revision, true, null);
+                        previous.Needs.Remove(prep);
+                        prep.Waiters.Remove(previous);
+                        RemoveUnused(prep, cleanup);
                     }
                 }
-
-                var subscriber = new RemoteSubscriber(
-                    session.Id,
-                    remoteTokenId,
-                    session,
-                    filterSignature,
-                    remoteFilter.PerformanceLevel,
-                    revision);
-                var preparedSubscriptions = new List<(ServerSubscriptionKey Key, AggregatedServerSubscription Aggregated)>();
-                var createdSubscriptions = new List<(ServerSubscriptionKey Key, AggregatedServerSubscription Aggregated)>();
-
+                var request = new Request { Key = key, Subscriber = new RemoteSubscriber(session.Id, remoteTokenId,
+                    session, signature, remoteFilter.PerformanceLevel, revision) };
+                requests[key] = request;
+                task = request.Completion.Task;
                 try
                 {
-                    foreach (var key in distinctSourceAndTypes)
+                    if (keys.Length == 0) throw new ArgumentException("Filter must contain at least one source/type.");
+                    if (remoteFilter.PerformanceLevel is not 0 and not 1) throw new ArgumentException("Unsupported PerformanceLevel: " + remoteFilter.PerformanceLevel);
+                    // Compile before reserving any group, including when all groups would be reused.
+                    var filters = keys.ToDictionary(k => k, k => new EventFilter(k.Source, k.EventType, 0, string.Empty));
+                    var missing = keys.Count(k => !preparations.ContainsKey(k));
+                    var waits = keys.Any(k => !preparations.TryGetValue(k, out var p) || !p.Ready);
+                    if (waits && (pendingRequests - (previous?.Pending == true ? 1 : 0) >= (long)maxPending + maxPreparations ||
+                        missing > (long)maxPending + Math.Max(0, maxPreparations - runningPreparations) - queue.Count))
+                        throw new InvalidOperationException("subscriptionPreparationCapacityExceeded");
+                    request.Pending = true;
+                    pendingRequests++;
+                    foreach (var groupKey in keys)
                     {
-                        if (!aggregatedSubscriptions.TryGetValue(key, out var aggregated))
+                        if (!preparations.TryGetValue(groupKey, out var prep))
                         {
-                            var localFilter = new EventFilter(
-                                key.Source,
-                                key.EventType,
-                                0,
-                                string.Empty);
-
-                            aggregated = new AggregatedServerSubscription
-                            {
-                                LocalFilter = localFilter,
-                            };
-
-                            SubscribeLocal(key, aggregated);
-                            WebSocketLog.Logger.Info("new : add sub to eventhub");
-                            aggregatedSubscriptions[key] = aggregated;
-                            createdSubscriptions.Add((key, aggregated));
+                            prep = new Preparation { Key = groupKey, Group = new AggregatedServerSubscription { LocalFilter = filters[groupKey] } };
+                            preparations.Add(groupKey, prep);
+                            prep.QueueNode = queue.AddLast(prep);
                         }
-
-                        preparedSubscriptions.Add((key, aggregated));
+                        request.Needs.Add(prep);
+                        prep.Waiters.Add(request);
                     }
+                    TryCommit(request, cleanup);
                 }
-                catch
-                {
-                    foreach (var created in createdSubscriptions)
-                    {
-                        if (created.Aggregated.Subscribers.IsEmpty)
-                        {
-                            aggregatedSubscriptions.TryRemove(created.Key, out _);
-                            UnsubscribeLocal(created.Aggregated);
-                        }
-                    }
+                catch (Exception ex) { Fail(request, ex.Message, cleanup); }
+                if (previous != null) CancelRequest(previous, cleanup);
+                StartQueued();
+            }
+            DisposeGroups(cleanup);
+            return task;
+        }
 
-                    throw;
-                }
+        public ServerSubscribeResult Subscribe(WebSocketSession session, Guid token, int revision, EventFilter filter) =>
+            SubscribeAsync(session, token, revision, filter).GetAwaiter().GetResult();
+        public ServerSubscribeResult Subscribe(WebSocketSession session, Guid token, EventFilter filter) => Subscribe(session, token, 0, filter);
 
-                var previousKeys = remoteIndex.TryGetValue(remoteKey, out var existingKeys)
-                    ? existingKeys
-                    : Array.Empty<ServerSubscriptionKey>();
-                var nextKeys = preparedSubscriptions
-                    .Select(item => item.Key)
-                    .Distinct()
-                    .ToArray();
-                var nextKeySet = nextKeys.ToHashSet();
-
-                foreach (var prepared in preparedSubscriptions)
-                {
-                    prepared.Aggregated.Subscribers[remoteKey] = subscriber;
-                }
-
-                remoteIndex[remoteKey] = nextKeys;
-                RemoveSubscriberFromKeys(remoteKey, previousKeys.Where(key => !nextKeySet.Contains(key)));
-                return new ServerSubscribeResult(revision, true, null);
+        private void StartQueued()
+        {
+            while (!disposed && runningPreparations < maxPreparations && queue.First != null)
+            {
+                var prep = queue.First.Value;
+                queue.RemoveFirst();
+                prep.QueueNode = null;
+                prep.Running = true;
+                runningPreparations++;
+                // Bounded blocking workers keep the shared timer/receive pool available for control traffic.
+                _ = Task.Factory.StartNew(() => Prepare(prep), CancellationToken.None,
+                    TaskCreationOptions.LongRunning, TaskScheduler.Default);
             }
         }
-
-        public ServerSubscribeResult Subscribe(
-            WebSocketSession session,
-            Guid remoteTokenId,
-            EventFilter remoteFilter)
+        private void Prepare(Preparation prep)
         {
-            return Subscribe(session, remoteTokenId, 0, remoteFilter);
+            Exception? error = null;
+            try { SubscribeLocal(prep.Key, prep.Group); }
+            catch (Exception ex) { error = ex; }
+            var cleanup = new List<AggregatedServerSubscription>();
+            lock (syncRoot)
+            {
+                prep.Running = false;
+                if (prep.Removed || disposed) cleanup.Add(prep.Group);
+                else if (error != null)
+                {
+                    foreach (var request in prep.Waiters.ToArray()) Fail(request, error.Message, cleanup);
+                    RemoveUnused(prep, cleanup);
+                }
+                else
+                {
+                    prep.Ready = true;
+                    foreach (var request in prep.Waiters.ToArray()) TryCommit(request, cleanup);
+                    RemoveUnused(prep, cleanup);
+                }
+            }
+            try { DisposeGroups(cleanup); }
+            finally { lock (syncRoot) { runningPreparations--; StartQueued(); } }
         }
-
+        private void TryCommit(Request request, List<AggregatedServerSubscription> cleanup)
+        {
+            if (!request.Pending || request.Needs.Any(p => !p.Ready)) return;
+            var oldKeys = remoteIndex.TryGetValue(request.Key, out var old) ? old : Array.Empty<ServerSubscriptionKey>();
+            var next = request.Needs.Select(p => p.Key).ToArray();
+            foreach (var prep in request.Needs)
+            {
+                prep.Group.Subscribers[request.Key] = request.Subscriber;
+                aggregatedSubscriptions[prep.Key] = prep.Group;
+            }
+            remoteIndex[request.Key] = next;
+            foreach (var oldKey in oldKeys.Except(next)) RemoveSubscriber(oldKey, request.Key, cleanup);
+            ReleaseNeeds(request, cleanup);
+            request.Completion.TrySetResult(new ServerSubscribeResult(request.Subscriber.Revision, true, null));
+        }
+        private void ReleaseNeeds(Request request, List<AggregatedServerSubscription> cleanup)
+        {
+            if (request.Pending) { request.Pending = false; pendingRequests--; }
+            foreach (var prep in request.Needs) { prep.Waiters.Remove(request); RemoveUnused(prep, cleanup); }
+            request.Needs.Clear();
+        }
+        private void Fail(Request request, string reason, List<AggregatedServerSubscription> cleanup)
+        {
+            ReleaseNeeds(request, cleanup);
+            request.Completion.TrySetResult(new ServerSubscribeResult(request.Subscriber.Revision, false, reason));
+        }
+        private void CancelRequest(Request request, List<AggregatedServerSubscription> cleanup)
+        {
+            ReleaseNeeds(request, cleanup);
+            request.Completion.TrySetCanceled();
+        }
+        private void RemoveUnused(Preparation prep, List<AggregatedServerSubscription> cleanup)
+        {
+            if (prep.Removed || prep.Waiters.Count != 0 || !prep.Group.Subscribers.IsEmpty) return;
+            prep.Removed = true;
+            prep.Group.IsActive = false;
+            preparations.Remove(prep.Key);
+            aggregatedSubscriptions.TryRemove(prep.Key, out _);
+            if (prep.QueueNode != null) { queue.Remove(prep.QueueNode); prep.QueueNode = null; }
+            if (!prep.Running) cleanup.Add(prep.Group);
+        }
+        private void RemoveSubscriber(ServerSubscriptionKey key, RemoteSubscriptionKey remote, List<AggregatedServerSubscription> cleanup)
+        {
+            if (!preparations.TryGetValue(key, out var prep)) return;
+            prep.Group.Subscribers.TryRemove(remote, out _);
+            RemoveUnused(prep, cleanup);
+        }
+        private void UnsubscribeCore(RemoteSubscriptionKey key, List<AggregatedServerSubscription> cleanup)
+        {
+            if (requests.Remove(key, out var request)) CancelRequest(request, cleanup);
+            if (remoteIndex.TryRemove(key, out var keys))
+                foreach (var groupKey in keys) RemoveSubscriber(groupKey, key, cleanup);
+        }
         public void Unsubscribe(Guid sessionId, Guid remoteTokenId)
         {
-            var remoteKey = new RemoteSubscriptionKey(sessionId, remoteTokenId);
-
-            lock (syncRoot)
-            {
-                UnsubscribeCore(remoteKey);
-            }
+            var cleanup = new List<AggregatedServerSubscription>();
+            lock (syncRoot) { UnsubscribeCore(new RemoteSubscriptionKey(sessionId, remoteTokenId), cleanup); StartQueued(); }
+            DisposeGroups(cleanup);
         }
-
         public void UnsubscribeSession(Guid sessionId)
         {
+            var cleanup = new List<AggregatedServerSubscription>();
             lock (syncRoot)
             {
-                var remoteKeys = remoteIndex.Keys
-                    .Where(key => key.SessionId == sessionId)
-                    .ToArray();
-
-                foreach (var remoteKey in remoteKeys)
-                {
-                    UnsubscribeCore(remoteKey);
-                }
+                foreach (var key in requests.Keys.Where(k => k.SessionId == sessionId).ToArray()) UnsubscribeCore(key, cleanup);
+                StartQueued();
             }
+            DisposeGroups(cleanup);
         }
-
         public void Dispose()
         {
+            var cleanup = new List<AggregatedServerSubscription>();
             lock (syncRoot)
             {
-                if (disposed)
-                {
-                    return;
-                }
-
+                if (disposed) return;
                 disposed = true;
-
-                foreach (var aggregated in aggregatedSubscriptions.Values)
-                {
-                    UnsubscribeLocal(aggregated);
-                }
-
-                aggregatedSubscriptions.Clear();
-                remoteIndex.Clear();
+                foreach (var key in requests.Keys.ToArray()) UnsubscribeCore(key, cleanup);
             }
+            DisposeGroups(cleanup);
         }
-
-        private void UnsubscribeCore(RemoteSubscriptionKey remoteKey)
+        internal bool IsCurrent(Guid sessionId, Guid tokenId, Task<ServerSubscribeResult> task)
         {
-            if (!remoteIndex.TryRemove(remoteKey, out var keys))
-            {
-                return;
-            }
-
-            RemoveSubscriberFromKeys(remoteKey, keys);
+            lock (syncRoot) return !disposed && requests.TryGetValue(new RemoteSubscriptionKey(sessionId, tokenId), out var request)
+                && ReferenceEquals(request.Completion.Task, task);
         }
+        internal int RunningPreparationCount { get { lock (syncRoot) return runningPreparations; } }
+        internal int QueuedPreparationCount { get { lock (syncRoot) return queue.Count; } }
+        internal int PendingRequestCount { get { lock (syncRoot) return pendingRequests; } }
+        private static string CreateFilterSignature(IEnumerable<ServerSubscriptionKey> keys) => string.Concat(
+            keys.Select(k => Connections.SubscriptionExpression.Encode(k.Source) + Connections.SubscriptionExpression.Encode(k.EventType))
+                .OrderBy(s => s, StringComparer.Ordinal).Select(s => s.Length + ":" + s));
+        private void DisposeGroups(IEnumerable<AggregatedServerSubscription> groups)
+        { foreach (var group in groups.Distinct()) UnsubscribeLocal(group); }
 
-        private bool TryGetSubscriber(RemoteSubscriptionKey remoteKey, out RemoteSubscriber subscriber)
+        private async Task FanOutAsync(AggregatedServerSubscription aggregated, EventArg eventArg)
         {
-            subscriber = null!;
-            if (!remoteIndex.TryGetValue(remoteKey, out var keys))
-            {
-                return false;
-            }
-
-            foreach (var key in keys)
-            {
-                if (aggregatedSubscriptions.TryGetValue(key, out var aggregated) &&
-                    aggregated.Subscribers.TryGetValue(remoteKey, out var existingSubscriber))
-                {
-                    subscriber = existingSubscriber;
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static string CreateFilterSignature(IEnumerable<ServerSubscriptionKey> keys)
-        {
-            return string.Join(
-                "\n",
-                keys.Select(key => $"{key.Source}\0{key.EventType}".ToUpperInvariant())
-                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase));
-        }
-
-        private void RemoveSubscriberFromKeys(RemoteSubscriptionKey remoteKey, IEnumerable<ServerSubscriptionKey> keys)
-        {
-            foreach (var key in keys.Distinct())
-            {
-                if (!aggregatedSubscriptions.TryGetValue(key, out var aggregated))
-                {
-                    continue;
-                }
-
-                aggregated.Subscribers.TryRemove(remoteKey, out _);
-
-                if (!aggregated.Subscribers.IsEmpty)
-                {
-                    continue;
-                }
-
-                aggregatedSubscriptions.TryRemove(key, out _);
-                UnsubscribeLocal(aggregated);
-            }
-        }
-
-        private async Task FanOutAsync(ServerSubscriptionKey key, EventArg eventArg)
-        {
-            if (!aggregatedSubscriptions.TryGetValue(key, out var aggregated))
+            if (!aggregated.IsActive)
             {
                 return;
             }
@@ -308,6 +275,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 {
                     try
                     {
+                        var remoteKey = new RemoteSubscriptionKey(subscriber.SessionId, subscriber.RemoteTokenId);
+                        if (!aggregated.IsActive || !aggregated.Subscribers.TryGetValue(remoteKey, out var current) || !ReferenceEquals(current, subscriber)) return;
                         await subscriber.Session
                             .SendRemoteEventAsync(
                                 subscriber.RemoteTokenId,
@@ -324,7 +293,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 }).ConfigureAwait(false);
         }
 
-        private async Task ObserveFanOutAsync(ServerSubscriptionKey key, EventArg eventArg)
+        private async Task ObserveFanOutAsync(AggregatedServerSubscription aggregated, EventArg eventArg)
         {
             var activeCount = Interlocked.Increment(ref activeFanOutEventCount);
             if (activeCount > maxConcurrentFanOutEvents)
@@ -344,12 +313,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 
             try
             {
-                await FanOutAsync(key, eventArg).ConfigureAwait(false);
+                await FanOutAsync(aggregated, eventArg).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 WebSocketLog.Logger.Error(
-                    $"WebSocket fan-out failed for {key}: {ex}");
+                    $"WebSocket fan-out failed: {ex}");
             }
             finally
             {
@@ -410,7 +379,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             {
                 var resourceSubscription = hub.SubscribeResource(
                     key.Source,
-                    eventArg => _ = ObserveFanOutAsync(key, eventArg),
+                    eventArg => _ = ObserveFanOutAsync(aggregated, eventArg),
                     key.EventType);
 
                 aggregated.LocalToken = resourceSubscription.Token;
@@ -418,11 +387,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 return;
             }
 
-            var token = hub.Subscribe(
+            var subscription = hub.SubscribeResources(
                 aggregated.LocalFilter,
-                eventArg => _ = ObserveFanOutAsync(key, eventArg));
-            aggregated.LocalToken = token;
-            aggregated.LocalSubscription = token;
+                eventArg => _ = ObserveFanOutAsync(aggregated, eventArg));
+            aggregated.LocalToken = subscription.Token;
+            aggregated.LocalSubscription = subscription;
         }
 
         private bool IsExactLocalResourcePath(string source)
@@ -433,7 +402,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 return resource != null && string.Equals(
                     resource.Path,
                     source,
-                    StringComparison.OrdinalIgnoreCase);
+                    StringComparison.OrdinalIgnoreCase) && !resource.Info.HasGetterParameters;
             }
             catch (ResourceDoesNotExistException)
             {
@@ -452,8 +421,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             {
                 aggregated.LocalSubscription.Dispose();
             }
-            catch
+            catch (Exception ex)
             {
+                try { WebSocketLog.Logger.Error($"Local subscription cleanup failed: {ex}"); }
+                catch { /* A failing log provider must not prevent the remaining groups from releasing. */ }
             }
         }
 

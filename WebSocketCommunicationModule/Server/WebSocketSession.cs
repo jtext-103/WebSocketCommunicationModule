@@ -21,6 +21,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
         private readonly SemaphoreSlim sendLock = new(1, 1);
         private readonly CancellationTokenSource cts = new();
         private readonly object lifecycleLock = new();
+        private readonly HashSet<Task<ServerSubscribeResult>> pendingAcks = new();
         private readonly DateTime createdAtUtc = DateTime.UtcNow;
         private DateTime? handshakeCompletedAtUtc;
         private DateTime lastReceivedAtUtc;
@@ -57,7 +58,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                     switch (message)
                     {
                         case SubscribeMessage subscribe:
-                            await SubscribeAsync(subscribe, linkedCts.Token).ConfigureAwait(false);
+                            BeginSubscribe(subscribe, linkedCts.Token);
                             break;
                         case UnsubscribeMessage unsubscribe:
                             await UnsubscribeAsync(unsubscribe.TokenId, linkedCts.Token).ConfigureAwait(false);
@@ -153,58 +154,54 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             handshakeCompletedAtUtc = DateTime.UtcNow;
         }
 
-        private async Task SubscribeAsync(SubscribeMessage message, CancellationToken cancellationToken)
+        private void BeginSubscribe(SubscribeMessage message, CancellationToken cancellationToken)
         {
-            if (message.Filter == null)
+            Task<ServerSubscribeResult> preparation;
+            var validationFailure = false;
+            lock (lifecycleLock)
             {
-                await SendAsync(new SubscribeAckMessage
+                if (Volatile.Read(ref disposed) != 0) return;
+                try
                 {
-                    TokenId = message.TokenId,
-                    Accepted = false,
-                    Reason = "Filter is required.",
-                }, cancellationToken).ConfigureAwait(false);
-                return;
+                    preparation = subscriptionManager.SubscribeAsync(this, message.TokenId, message.Revision,
+                        message.Filter ?? new EventFilter());
+                }
+                catch (Exception ex)
+                {
+                    validationFailure = true;
+                    preparation = Task.FromResult(new ServerSubscribeResult(message.Revision, false, ex.Message));
+                }
+                // Retransmissions wait for the same outcome without accumulating continuations.
+                if (!pendingAcks.Add(preparation)) return;
             }
+            _ = CompleteSubscribeAsync(message.TokenId, preparation, cancellationToken, validationFailure);
+        }
 
+        private async Task CompleteSubscribeAsync(Guid tokenId, Task<ServerSubscribeResult> preparation, CancellationToken cancellationToken, bool validationFailure)
+        {
             try
             {
-                ServerSubscribeResult result;
+                var result = await preparation.ConfigureAwait(false);
+                bool IsValid() => Volatile.Read(ref disposed) == 0 &&
+                    (validationFailure || subscriptionManager.IsCurrent(Id, tokenId, preparation) ||
+                     (!result.Accepted && result.Reason is "staleRevision" or "revisionConflict"));
                 lock (lifecycleLock)
                 {
-                    if (Volatile.Read(ref disposed) != 0)
-                    {
-                        return;
-                    }
-
-                    result = subscriptionManager.Subscribe(
-                        this,
-                        message.TokenId,
-                        message.Revision,
-                        message.Filter);
-                    if (result.Accepted)
-                    {
-                        remoteTokens[message.TokenId] = 0;
-                    }
+                    if (!IsValid()) return;
+                    if (result.Accepted) remoteTokens[tokenId] = 0;
                 }
-
-                await SendAsync(new SubscribeAckMessage
-                {
-                    TokenId = message.TokenId,
-                    Revision = result.Revision,
-                    Accepted = result.Accepted,
-                    Reason = result.Reason,
-                }, cancellationToken).ConfigureAwait(false);
+                var payload = SerializeMessage(new SubscribeAckMessage
+                { TokenId = tokenId, Revision = result.Revision, Accepted = result.Accepted, Reason = result.Reason });
+                await SendPayloadAsync(payload, cancellationToken, IsValid).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (preparation.IsCanceled || cancellationToken.IsCancellationRequested || cts.IsCancellationRequested) { }
             catch (Exception ex)
             {
-                await SendAsync(new SubscribeAckMessage
-                {
-                    TokenId = message.TokenId,
-                    Revision = message.Revision,
-                    Accepted = false,
-                    Reason = ex.Message,
-                }, cancellationToken).ConfigureAwait(false);
+                try { WebSocketLog.Logger.Error($"Subscribe acknowledgement failed: session={Id}, token={tokenId}: {ex}"); }
+                catch { /* Session cleanup must survive a failing log provider. */ }
+                Dispose();
             }
+            finally { lock (lifecycleLock) pendingAcks.Remove(preparation); }
         }
 
         private async Task UnsubscribeAsync(Guid remoteTokenId, CancellationToken cancellationToken)
@@ -305,7 +302,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             return payload;
         }
 
-        private async Task SendPayloadAsync(byte[] payload, CancellationToken cancellationToken)
+        private async Task SendPayloadAsync(byte[] payload, CancellationToken cancellationToken, Func<bool>? isValid = null)
         {
             using var sendCts = CreateTimeoutTokenSource(
                 cancellationToken,
@@ -314,6 +311,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
             await sendLock.WaitAsync(sendCts.Token).ConfigureAwait(false);
             try
             {
+                if (isValid != null && !isValid()) return;
                 await socket.SendAsync(
                     payload,
                     WebSocketMessageType.Text,

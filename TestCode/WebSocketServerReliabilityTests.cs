@@ -431,6 +431,24 @@ public sealed class WebSocketServerReliabilityTests : CFET2Host
         return (bool)method.Invoke(null, [exception])!;
     }
 
+    [TestMethod]
+    public async Task Session_SubscribeAckSendTimeoutShouldDisposeAndReleaseSubscription()
+    {
+        using var manager = new WebSocketSubscriptionManager(MyHub, 1);
+        var hello = WebSocketMessageSerializer.Serialize(new HelloMessage());
+        var subscribe = WebSocketMessageSerializer.Serialize(new SubscribeMessage
+        {
+            TokenId = Guid.NewGuid(), Filter = new EventFilter("/ack/.*", "alarm")
+        });
+        using var socket = new ScriptedWebSocket([hello, subscribe], receiveFailure: null, blockSendAfter: 1);
+        using var session = new WebSocketSession(new WebSocketCommunicationOptions
+        { ServerSendTimeout = TimeSpan.FromMilliseconds(40) }, manager, socket);
+        await session.RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.AreEqual(WebSocketState.Closed, socket.State);
+        Assert.AreEqual(0, manager.RemoteSubscriptionCount);
+        Assert.AreEqual(0, manager.AggregatedSubscriptionCount);
+    }
+
     private static byte[] InvokeSerializeMessage(WebSocketSession session, WebSocketMessageEnvelope message)
     {
         var method = typeof(WebSocketSession).GetMethod(
