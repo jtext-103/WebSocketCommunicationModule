@@ -80,6 +80,18 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
 
         public static WebSocketMessageEnvelope DeserializeMessage(string json)
         {
+            try
+            {
+                return DeserializeMessageCore(json);
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidCastException or OverflowException or ArgumentException)
+            {
+                throw new FormatException("WebSocket message contains invalid fields.", ex);
+            }
+        }
+
+        private static WebSocketMessageEnvelope DeserializeMessageCore(string json)
+        {
             var obj = ParseAndValidateEnvelope(json);
             var messageType = obj.Value<string>("messageType")!;
 

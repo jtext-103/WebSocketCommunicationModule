@@ -464,9 +464,11 @@ public sealed class WebSocketSubscriptionPhase4Tests : CFET2Host
 
         public int AcceptedCount { get; private set; }
 
-        public List<SubscribeMessage> SubscribeMessages { get; } = new();
+        private readonly System.Collections.Concurrent.ConcurrentQueue<SubscribeMessage> subscribeMessages = new();
+        public IReadOnlyList<SubscribeMessage> SubscribeMessages => subscribeMessages.ToArray();
 
-        public List<UnsubscribeMessage> UnsubscribeMessages { get; } = new();
+        private readonly System.Collections.Concurrent.ConcurrentQueue<UnsubscribeMessage> unsubscribeMessages = new();
+        public IReadOnlyList<UnsubscribeMessage> UnsubscribeMessages => unsubscribeMessages.ToArray();
 
         public static SubscriptionServer Start(Func<Guid, SubscribeAckMessage> subscribeAckFactory)
         {
@@ -552,7 +554,7 @@ public sealed class WebSocketSubscriptionPhase4Tests : CFET2Host
                         case SubscribeMessage subscribe:
                             lock (gate)
                             {
-                                SubscribeMessages.Add(subscribe);
+                                subscribeMessages.Enqueue(subscribe);
                             }
 
                             var ack = subscribeAckFactory(subscribe.TokenId);
@@ -567,7 +569,7 @@ public sealed class WebSocketSubscriptionPhase4Tests : CFET2Host
                         case UnsubscribeMessage unsubscribe:
                             lock (gate)
                             {
-                                UnsubscribeMessages.Add(unsubscribe);
+                                unsubscribeMessages.Enqueue(unsubscribe);
                             }
 
                             break;

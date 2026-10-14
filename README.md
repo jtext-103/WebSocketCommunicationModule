@@ -4,12 +4,12 @@ CFET2 的远程事件通信模块。它通过 WebSocket 实现远程订阅、事
 
 ## 功能
 
-- 注册 `ws` 与 `http` 协议；`http://host:port` 映射到 `ws://host:port+1` 的事件端点。
+- 注册 `ws` 与 `http` 协议；HTTP 事件订阅由 Core 的 HttpEventSubscriptionTransport 选择模块；选择 WebSocket 时，`http://host:port` 映射到 `ws://host:{port + WebSocketPortOffset}` 的事件端点，偏移默认 1。
 - 复用同一远端 endpoint 的客户端连接。
 - 支持订阅确认、失败重试、取消订阅、心跳、超时和重连。
 - 按 endpoint/source/event type 聚合客户端订阅，并在服务端复用本地 EventHub 订阅后 fan-out。
-- 支持 `PerformanceLevel` 0 和 1。
-- 服务端精确资源订阅复用 Core 的标量自动观测规则；未标记 `[Cfet2Event]` 的复杂资源返回带原因的失败 ACK，原生事件复杂资源仍可主动发布。详见 [Core 类型边界](../newcfet2core/README.md#资源自动观测的类型边界)。
+- 支持 `PerformanceLevel` 0 和 1：0 传输完整 EventArg，1 传输 Source、EventType、Value、Timestamp。等级不参与客户端聚合键，组内按最小等级决定远端载荷，并在成员变化时更新。
+- 服务端无参数精确资源订阅复用 Core 的标量及受支持容器自动观测规则；不支持的自动观测类型返回带原因的失败 ACK。正则组合逐资源跳过不合格观察；含参数 getter 不轮询，WS 基础含参数来源和详细事件路径走纯事件订阅，Core 远程 SubscribeResource 的初值由资源模块读取。原生事件复杂资源仍可主动发布。详见 [Core 类型边界](../newcfet2core/README.md#资源自动观测的类型边界)。
 - 客户端收到当前订阅的失败 ACK 后，保存 `Failed/LastError` 并记录 Error 日志，包含远端、资源/事件、token、revision 和原因。同一次失败不重复输出，过期或未知 token 的 ACK 不报错。CFET2APP 默认同时输出到控制台及程序目录的 `Log_yyyy-MM-dd.txt`；自定义宿主按其日志 Provider 配置输出。
 - 再次订阅同一失败聚合组且无需变更远端订阅时，每次调用都会输出已保存的失败原因，不重新发送 Subscribe。重复 ACK 去重与用户再次调用订阅分别处理。
 - 内部统一使用 `WebSocketLog.Logger`，默认是无输出的 EmptyLogger；WebSocketCM 构造时切换为 `Cfet2LogManager.GetLogger("WebSocket")`。宿主应先配置日志 Provider，再创建模块。内部对象不缓存 Logger，初始化前创建的对象也会在后续调用时使用新 Logger；初始化前的日志不补写。同一进程中的 WebSocketCM 共用该入口，内部组件构造函数不再逐层接收 logger。

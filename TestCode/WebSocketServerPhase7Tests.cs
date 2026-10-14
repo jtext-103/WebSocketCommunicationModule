@@ -260,7 +260,7 @@ public sealed partial class WebSocketServerPhase7Tests : CFET2Host
     }
 
     [TestMethod]
-    public async Task Server_InvalidJsonAfterHandshake_ShouldCloseOnlyThatSession()
+    public async Task Server_InvalidJsonAfterHandshake_ShouldDiscardAndKeepSessionUsable()
     {
         var listenUri = CreateListenUri();
         using var module = StartServerModule(listenUri);
@@ -269,12 +269,14 @@ public sealed partial class WebSocketServerPhase7Tests : CFET2Host
 
         await SendRawTextAsync(invalidClient, "{ invalid json");
 
-        await AssertThrowsAsync<WebSocketException>(() => ReceiveAsync(invalidClient, 1000));
+        await SendAsync(invalidClient, new PingMessage());
+        _ = await ReceiveUntilAsync<PongMessage>(invalidClient);
+        await SubscribeAsync(invalidClient, Guid.NewGuid(), "/thing/status", "Changed");
         await SubscribeAsync(healthyClient, Guid.NewGuid(), "/thing/status", "Changed");
     }
 
     [TestMethod]
-    public async Task Server_WrongProtocolAfterHandshake_ShouldCloseOnlyThatSession()
+    public async Task Server_WrongProtocolAfterHandshake_ShouldDiscardAndKeepSessionUsable()
     {
         var listenUri = CreateListenUri();
         using var module = StartServerModule(listenUri);
@@ -289,9 +291,46 @@ public sealed partial class WebSocketServerPhase7Tests : CFET2Host
             }
             """);
 
-        await AssertThrowsAsync<WebSocketException>(() => ReceiveAsync(invalidClient, 1000));
+        await SendAsync(invalidClient, new PingMessage());
+        _ = await ReceiveUntilAsync<PongMessage>(invalidClient);
         await SendAsync(healthyClient, new PingMessage());
         _ = await ReceiveUntilAsync<PongMessage>(healthyClient);
+    }
+
+    [TestMethod]
+    [DataRow(WebSocketMessageType.Text)]
+    [DataRow(WebSocketMessageType.Binary)]
+    public async Task Server_RejectedFragmentedMessage_ShouldDrainAndPreserveSubscription(WebSocketMessageType type)
+    {
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri, maxMessageBytes: 4096);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        await SubscribeAsync(client, Guid.NewGuid(), "/thing/status", "Changed");
+        var count = GetLocalSubscriptionCount();
+        var fragment = new byte[3000];
+        await client.SendAsync(fragment, type, false, CancellationToken.None);
+        await client.SendAsync(fragment, type, false, CancellationToken.None);
+        await client.SendAsync(fragment, type, true, CancellationToken.None);
+        await SendAsync(client, new PingMessage());
+        _ = await ReceiveUntilAsync<PongMessage>(client);
+        Assert.AreEqual(WebSocketState.Open, client.State);
+        Assert.AreEqual(count, GetLocalSubscriptionCount());
+    }
+
+    [TestMethod]
+    [DataRow("unknown", "\"tokenId\":null")]
+    [DataRow("subscribe", "\"tokenId\":\"not-a-guid\"")]
+    [DataRow("subscribe", "\"revision\":999999999999999999999999999")]
+    public async Task Server_InvalidMessageFields_ShouldDiscardAndContinue(string type, string fields)
+    {
+        var listenUri = CreateListenUri();
+        using var module = StartServerModule(listenUri);
+        using var client = await ConnectAndHelloAsync(listenUri);
+        await SendRawTextAsync(client, "{\"messageType\":\"" + type +
+            "\",\"protocol\":\"cfet2.websocket.event\",\"version\":2," + fields + "}");
+        await SendAsync(client, new PingMessage());
+        _ = await ReceiveUntilAsync<PongMessage>(client);
+        await SubscribeAsync(client, Guid.NewGuid(), "/thing/status", "Changed");
     }
 
     [TestMethod]

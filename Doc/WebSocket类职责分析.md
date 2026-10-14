@@ -60,7 +60,7 @@ Connections/*
 - 保存 Core 注册的 `eventCallback`。
 - 持有 `RemoteEndpointKey -> RemoteEndpointClient` 的 endpoint client 池。
 - 持有 `ClientSubscriptionAggregator`。
-- `Subscribe` 时校验 token/filter，提示 `PerformanceLevel` 不支持，然后让 aggregator 生成 `ClientSubscriptionPlan`。
+- `Subscribe` 时校验 token/filter，校验 PerformanceLevel 仅允许 0/1，然后让 aggregator 生成 `ClientSubscriptionPlan`。
 - `UnSubScribe` 时让 aggregator 生成退订计划。
 - 通过 `EnqueueClientPlan` 把 plan 路由到对应 `RemoteEndpointClient`。
 - 监听 endpoint client 的 `RemoteEventReceived`、`ConnectionStatusChanged`、`Idle` 事件。
@@ -126,7 +126,7 @@ Connections/*
 当前功能：
 
 - 实现 `GetFullHost(protocol, hostname, port)`。
-- `http` 映射到 `ws://host:{port + 1}`。
+- 选择 WebSocket 传输时，http 映射到 `ws://host:{port + WebSocketPortOffset}`，偏移默认 1，由生效配置快照提供。
 - `ws` 映射到 `ws://host:{port}`。
 
 职责评价：
@@ -507,7 +507,7 @@ Connections/*
 职责评价：
 
 - 值对象职责清晰。
-- 不包含 `PerformanceLevel`，与当前 WebSocketCM 不支持性能等级传输优化的实现一致。
+- 聚合键不包含 PerformanceLevel；聚合组另外保存各本地 token 的等级，按最小等级决定完整或精简载荷，并在成员变化时更新远端订阅。
 
 ### 5.3 `ClientSubscriptionGroup`
 

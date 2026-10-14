@@ -14,7 +14,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
 
             if (string.Equals("http", protocol, StringComparison.OrdinalIgnoreCase))
             {
-                return BuildWebSocketHost(hostname, port + 1);
+                return BuildWebSocketHost(hostname, (MyHub?.ActiveEventCommunicationConfiguration ?? standaloneConfiguration).GetWebSocketPort(port));
             }
 
             if (string.Equals("ws", protocol, StringComparison.OrdinalIgnoreCase))

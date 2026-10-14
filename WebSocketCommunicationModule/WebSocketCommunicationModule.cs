@@ -14,9 +14,15 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
 {
     public partial class WebSocketCommunicationModule : IEventCommunicationModule
     {
+        public override Jtext103.CFET2.Core.Config.EventTransport? Transport => Jtext103.CFET2.Core.Config.EventTransport.WebSocket;
+
         public override string[] ProtocolNames => ["ws", "http"];
 
         private readonly WebSocketCommunicationOptions options;
+        private readonly Jtext103.CFET2.Core.Config.EventCommunicationConfiguration standaloneConfiguration =
+            new(Jtext103.CFET2.Core.Config.GlobalConfig.EventPublishTransports,
+                Jtext103.CFET2.Core.Config.GlobalConfig.HttpEventSubscriptionTransport,
+                Jtext103.CFET2.Core.Config.GlobalConfig.WebSocketPortOffset);
         private readonly ConcurrentDictionary<RemoteEndpointKey, RemoteEndpointClient> endpointClients = new();
         private readonly ClientSubscriptionAggregator subscriptionAggregator = new();
         private readonly object lifecycleLock = new();

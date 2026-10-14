@@ -53,8 +53,18 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 while (!linkedCts.IsCancellationRequested &&
                        socket.State == WebSocketState.Open)
                 {
-                    var json = await ReceiveTextMessageAsync(linkedCts.Token).ConfigureAwait(false);
-                    var message = WebSocketMessageSerializer.DeserializeMessage(json);
+                    WebSocketMessageEnvelope message;
+                    try
+                    {
+                        var json = await ReceiveTextMessageAsync(linkedCts.Token).ConfigureAwait(false);
+                        message = WebSocketMessageSerializer.DeserializeMessage(json);
+                    }
+                    catch (FormatException ex)
+                    {
+                        lastReceivedAtUtc = DateTime.UtcNow;
+                        WebSocketLog.Logger.Warn($"WebSocket message discarded: session={Id}, reason={ex.Message}");
+                        continue;
+                    }
                     switch (message)
                     {
                         case SubscribeMessage subscribe:
@@ -337,32 +347,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
         private async Task<string> ReceiveTextMessageAsync(CancellationToken cancellationToken)
         {
             using var idleCts = CreateTimeoutTokenSource(cancellationToken, options.ServerIdleTimeout);
-            var buffer = new byte[options.ReceiveBufferSize];
-            using var stream = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
-            {
-                result = await socket.ReceiveAsync(buffer, idleCts.Token).ConfigureAwait(false);
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    throw new WebSocketException("WebSocket closed.");
-                }
-
-                if (result.MessageType != WebSocketMessageType.Text)
-                {
-                    throw new FormatException("Only text WebSocket messages are supported.");
-                }
-
-                stream.Write(buffer, 0, result.Count);
-                if (stream.Length > options.MaxMessageBytes)
-                {
-                    throw new FormatException("WebSocket message exceeds the maximum allowed size.");
-                }
-            }
-            while (!result.EndOfMessage);
-
+            var json = await WebSocketMessageReceiver.ReceiveTextAsync(socket, options.ReceiveBufferSize,
+                options.MaxMessageBytes, idleCts.Token).ConfigureAwait(false);
             lastReceivedAtUtc = DateTime.UtcNow;
-            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+            return json;
         }
 
         private static CancellationTokenSource CreateTimeoutTokenSource(

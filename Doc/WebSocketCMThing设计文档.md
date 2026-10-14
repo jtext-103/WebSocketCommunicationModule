@@ -347,7 +347,7 @@ ws://ip:port
 
 | 输入 | 实际查询 endpoint |
 | --- | --- |
-| `http://ip:port` | `ws://ip:{port + 1}/cfet2/event/v2` |
+| `http://ip:port` | `ws://ip:{port + WebSocketPortOffset}/cfet2/event/v2` |
 | `ws://ip:port` | `ws://ip:port/cfet2/event/v2` |
 
 要求：
@@ -607,7 +607,7 @@ Status 查询不得：
 4. 重连时 `RetryCount`、`LastError` 和 `LastReceivedAtUtc` 正确。
 5. 多个本地 token 聚合为一个 master token 时，各计数语义正确。
 6. 返回 DTO 后内部状态变化不会修改旧 DTO。
-7. `http://ip:port` 能按照 `port + 1` 查询对应 remote client。
+7. http://ip:port 能按照生效 WebSocketPortOffset（默认 1）查询对应 remote client。
 8. `ws://ip:port` 能按照原 port 查询对应 remote client。
 9. 查询不存在的 hostname 返回 null，格式错误或空白的 hostname 返回 null。
 10. `PrintRemoteClients()` 和 `PrintRemoteClient(hostname)` 输出与结构化快照一致。

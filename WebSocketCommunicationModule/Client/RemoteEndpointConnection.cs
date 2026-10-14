@@ -347,13 +347,20 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 {
                     return;
                 }
+                catch (FormatException ex)
+                {
+                    if (IsCurrentGeneration(generation))
+                    {
+                        lastReceivedAtUtc = DateTime.UtcNow;
+                        WebSocketLog.Logger.Warn($"WebSocket message discarded: endpoint={endpoint}, reason={ex.Message}");
+                    }
+                    continue;
+                }
                 catch (Exception ex)
                 {
                     if (IsCurrentGeneration(generation) && State != RemoteConnectionState.Disposed)
                     {
-                        HandleConnectionFailure(ex is FormatException
-                            ? new WebSocketProtocolException("Invalid WebSocket message received.", ex)
-                            : ex);
+                        HandleConnectionFailure(ex);
                     }
 
                     return;
@@ -368,11 +375,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 {
                     if (IsCurrentGeneration(generation))
                     {
-                        HandleConnectionFailure(
-                            new WebSocketProtocolException("Invalid WebSocket message received.", ex));
+                        WebSocketLog.Logger.Warn($"WebSocket message discarded: endpoint={endpoint}, reason={ex.Message}");
                     }
 
-                    return;
+                    continue;
                 }
 
                 try
@@ -643,34 +649,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         private async Task<string> ReceiveTextMessageAsync(ClientWebSocket socket, CancellationToken cancellationToken)
         {
-            var buffer = new byte[options.ReceiveBufferSize];
-            using var stream = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
-            {
-                result = await socket
-                    .ReceiveAsync(buffer, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    throw new WebSocketException("WebSocket closed while waiting for a message.");
-                }
-
-                if (result.MessageType != WebSocketMessageType.Text)
-                {
-                    throw new FormatException("Only text WebSocket messages are supported.");
-                }
-
-                stream.Write(buffer, 0, result.Count);
-                if (stream.Length > options.MaxMessageBytes)
-                {
-                    throw new FormatException("WebSocket message exceeds the maximum allowed size.");
-                }
-            }
-            while (!result.EndOfMessage);
-
-            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+            return await WebSocketMessageReceiver.ReceiveTextAsync(socket, options.ReceiveBufferSize,
+                options.MaxMessageBytes, cancellationToken).ConfigureAwait(false);
         }
 
         private bool IsCurrentGeneration(long generation)

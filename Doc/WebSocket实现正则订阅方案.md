@@ -5,6 +5,8 @@
 
 本次确认：异步准备、100ms 慢 Get 报警、保留 ACK 超时策略、revision 失败幂等、有限准备容量及重叠规则问题独立处理均已确定。下述慢 Get 监测已作为本次 Core 配套改动实现。
 
+2026-10-14 文档同步：Core 参数化精确订阅已支持初读和指定路径主动事件，WS 含参数基础来源及详细路径使用纯事件订阅，不在 WS 服务端重复初读；所有含参数 getter 均不自动观察，包括默认参数和 params。旧阶段测试数量保留，下文当前行为按最新规则更新。
+
 关联文档：
 
 - [Core 正则资源观察实现文档](../../newcfet2core/Code/CFET2Core/doc/Core%20正则资源观察/Core%20正则资源观察实现文档.md)
@@ -271,13 +273,13 @@ Core 当前有已记录缺陷：初次读取返回无效 Sample 时，观察结�
 | 条件 | 当前行为 |
 |---|---|
 | Core 组合订阅 `/device/Temperature + changed` | 匹配基础资源，但必填参数无法提供，观察结果为 Skipped；事件过滤仍有效 |
-| WS 精确来源 `/device/Temperature` | 进入原有 SubscribeResource 分支；无参数初次读取无法完成时订阅失败，不能套用上一行的批量跳过行为 |
+| WS 精确来源 `/device/Temperature` | 含参数基础来源走纯事件订阅，不在 WS 服务端初读或观察；Core SubscribeResource 调用者仍须先通过资源模块取得有效初值 |
 | `/device/Temperature/.* + changed` | 不匹配基础注册路径，观察集合为空；仍可接收 `/device/Temperature/1` 等主动发布的匹配事件 |
 | `/device/Temperature/* + changed` | `*` 重复前面的 `/`，不是通配符；可匹配基础路径及尾随斜杠，不能表示任意 channel |
 
 当前不会枚举参数取值，不会自动观察所有 channel。单资源 SubscribeResource 即使通过带后缀路径找到基础资源，也不能据此认为参数已传给观察读取；普通 Get 支持参数不等于自动观察支持参数。
 
-全部读取参数有默认值时，只可能读取默认参数对应值，不能代表显式参数的独立观察。完整支持需要另行设计“资源 + 参数”的共享键、初值、事件来源路径和参数枚举规则。
+全部读取参数有默认值或为 params 时，自动观察入口仍跳过该资源，不执行 getter。Core 精确 SubscribeResource 可按地址读取默认值或指定参数的初值，之后接收主动事件；这不建立轮询。完整支持需要另行设计“资源 + 参数”的共享键、初值、事件来源路径和参数枚举规则。
 
 ## 10. 文件修改范围
 
@@ -356,12 +358,12 @@ Core 已覆盖的类型、基线和读取恢复细节可复用底层回归；WS 
 
 | 编号 | 请求或场景 | 验收结果 |
 |---|---|---|
-| P01 | WS 精确 `/device/Temperature` | 保留 SubscribeResource 初读失败行为，不套用批量跳过 |
+| P01 | WS 精确 `/device/Temperature`（含参数 getter） | 接受纯事件订阅，不执行来源端初读或自动观察 |
 | P02 | regex `/device/Temp.*` | 匹配基础资源，观察 Skipped；匹配的主动事件仍可接收 |
 | P03 | `/device/Temperature/.*` | 观察集合为空，不枚举 channel；可接收 `/device/Temperature/1` 主动事件 |
 | P04 | `/device/Temperature/*` | 按正则量词解释，不当作任意子路径通配符 |
 | P05 | `/device/Temperature/1` | 不因查找回退而错误启动基础资源观察 |
-| P06 | getter 参数全部有默认值 | 只观察默认读取结果，不生成各 channel 的独立观察 |
+| P06 | getter 参数全部有默认值 | 跳过自动观察，不执行 getter；主动事件过滤仍有效 |
 
 这些是当前限制的边界测试，不能将 ACK 接受写成带参数观察成功。
 
@@ -675,6 +677,6 @@ WS 管理器补测见 [WebSocketRegexCoverageTests.cs](../TestCode/WebSocketRege
 
 ## 2026-10-12 参数化订阅更新
 
-按 [订阅使用设计文档](../../docs/订阅使用设计文档.md) 执行：所有声明参数的 getter 均禁止自动观察，包括默认参数和空 params。WS 基础含参数 CR 走组合事件分支，不执行 SubscribeResource 初读；详细路径及正则仍只接收参数化主动事件。无参数精确资源使用 SubscribeResource 的字面来源过滤，注册路径中的点号不再误匹配其他路径；显式正则保持原规则。
+按 [订阅使用设计文档](../../newcfet2core/Code/CFET2Core/doc/订阅使用/订阅使用设计文档.md) 执行：所有声明参数的 getter 均禁止自动观察，包括默认参数和空 params。WS 基础含参数 CR 走组合事件分支，不执行 SubscribeResource 初读；详细路径及正则仍只接收参数化主动事件。无参数精确资源使用 SubscribeResource 的字面来源过滤，注册路径中的点号不再误匹配其他路径；显式正则保持原规则。
 
 新增 12 项 WS 参数分支/载荷用例，更新旧必填参数拒绝、默认参数观察和元字符路径用例；部分失败清理测试改用真正初读失败的无参数资源。2026-10-12 WS 全量 265 项通过，无失败或跳过。前文数字及旧规则属于对应阶段记录。

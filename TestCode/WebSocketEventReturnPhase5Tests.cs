@@ -230,22 +230,43 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
     }
 
     [TestMethod]
-    public async Task UnsupportedMessageAfterHandshake_ShouldPermanentlyFailConnection()
+    public async Task UnsupportedMessageAfterHandshake_ShouldDiscardAndDeliverNextEvent()
     {
-        using var server = EventPushServer.Start((_, _) => new UnsupportedMessage());
+        using var server = EventPushServer.StartMany((id, _) => [new UnsupportedMessage(),
+            new RemoteEventMessage { TokenId = id, EventArg = new EventArg("/thing/status", "Changed", new Status<int>(123)) }]);
         using var module = CreateModule();
         var token = CreateToken();
-
+        var received = new System.Collections.Concurrent.ConcurrentQueue<EventArg>();
+        module.RegisterEventCallback(e => { if (e.Source == "/thing/status") received.Enqueue(e); });
         module.Subscribe(token, CreateFilter(server.Endpoint));
-
-        Assert.IsTrue(await WaitUntilAsync(() =>
-            WebSocketClientTestHelper.GetOnlyEndpointClient(module).State == RemoteConnectionState.Failed));
+        Assert.IsTrue(await WaitUntilAsync(() => received.Count == 1));
         Assert.AreEqual(
-            SubscriptionState.Failed,
+            SubscriptionState.Active,
             WebSocketClientTestHelper.GetSubscriptionForLocalToken(module, token.Id)?.State);
+        Assert.AreEqual(123, received.Single().Sample.GetVal<int>());
+        Assert.AreEqual(1, server.ConnectionCount);
     }
 
-    private WebSocketCommunicationModule CreateModule()
+    [TestMethod]
+    public async Task BadMessagesAfterHandshake_ShouldPreserveClientConnectionAndSubscription()
+    {
+        using var server = EventPushServer.StartWithBadMessages((id, _) => new RemoteEventMessage
+        {
+            TokenId = id, EventArg = new EventArg("/thing/status", "Changed", new Status<int>(456)),
+        });
+        using var module = CreateModule(maxMessageBytes: 4096);
+        var received = new System.Collections.Concurrent.ConcurrentQueue<EventArg>();
+        module.RegisterEventCallback(e => { if (e.Source == "/thing/status") received.Enqueue(e); });
+        var token = CreateToken();
+        module.Subscribe(token, CreateFilter(server.Endpoint));
+        Assert.IsTrue(await WaitUntilAsync(() => received.Count == 1));
+        Assert.AreEqual(456, received.Single().Sample.GetVal<int>());
+        Assert.AreEqual(SubscriptionState.Active,
+            WebSocketClientTestHelper.GetSubscriptionForLocalToken(module, token.Id)?.State);
+        Assert.AreEqual(1, server.ConnectionCount);
+    }
+
+    private WebSocketCommunicationModule CreateModule(int maxMessageBytes = 4 * 1024 * 1024)
     {
         return new WebSocketCommunicationModule(new WebSocketCommunicationOptions
         {
@@ -253,6 +274,7 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
             HandshakeTimeout = TimeSpan.FromSeconds(3),
             SendTimeout = TimeSpan.FromSeconds(3),
             ReceiveBufferSize = 1024,
+            MaxMessageBytes = maxMessageBytes,
             ResubscribeInterval = TimeSpan.Zero,
         });
     }
@@ -327,17 +349,19 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         private readonly Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory;
         private readonly bool closeAfterSubscribe;
         private readonly bool beforeAck;
+        private readonly bool sendBadMessages;
         public readonly TaskCompletionSource AllowAck = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly HttpListener listener;
         private readonly List<WebSocket> sockets = new();
         private readonly object gate = new();
         private readonly Task acceptLoop;
 
-        private EventPushServer(Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory, bool closeAfterSubscribe, bool beforeAck = false)
+        private EventPushServer(Func<Guid, string, WebSocketMessageEnvelope[]> eventFactory, bool closeAfterSubscribe, bool beforeAck = false, bool sendBadMessages = false)
         {
             this.eventFactory = eventFactory;
             this.closeAfterSubscribe = closeAfterSubscribe;
             this.beforeAck = beforeAck;
+            this.sendBadMessages = sendBadMessages;
             Port = GetFreePort();
             Endpoint = $"ws://127.0.0.1:{Port}/cfet2/event/v2";
             listener = new HttpListener();
@@ -349,6 +373,10 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
         public string Endpoint { get; }
 
         public int Port { get; }
+        public int ConnectionCount { get { lock (gate) return sockets.Count; } }
+
+        public static EventPushServer StartWithBadMessages(Func<Guid, string, WebSocketMessageEnvelope> factory)
+            => new((id, endpoint) => [factory(id, endpoint)], false, sendBadMessages: true);
 
         public static EventPushServer Start(Func<Guid, string, WebSocketMessageEnvelope> eventFactory)
         {
@@ -458,6 +486,26 @@ public sealed class WebSocketEventReturnPhase5Tests : CFET2Host
                         "test close",
                         CancellationToken.None);
                     return;
+                }
+
+                if (sendBadMessages)
+                {
+                    foreach (var badJson in new[]
+                    {
+                        "{ invalid json",
+                        "{\"messageType\":\"ping\",\"protocol\":\"wrong\",\"version\":2}",
+                        "{\"messageType\":\"ping\",\"protocol\":\"cfet2.websocket.event\",\"version\":1}",
+                        "{\"messageType\":\"event\",\"protocol\":\"cfet2.websocket.event\",\"version\":2,\"tokenId\":\"not-a-guid\"}",
+                        "{\"messageType\":\"subscribeAck\",\"protocol\":\"cfet2.websocket.event\",\"version\":2,\"revision\":999999999999999999999999999}",
+                    })
+                        await wsContext.WebSocket.SendAsync(Encoding.UTF8.GetBytes(badJson), WebSocketMessageType.Text, true, cts.Token);
+                    foreach (var type in new[] { WebSocketMessageType.Text, WebSocketMessageType.Binary })
+                    {
+                        var fragment = new byte[3000];
+                        await wsContext.WebSocket.SendAsync(fragment, type, false, cts.Token);
+                        await wsContext.WebSocket.SendAsync(fragment, type, false, cts.Token);
+                        await wsContext.WebSocket.SendAsync(fragment, type, true, cts.Token);
+                    }
                 }
 
                 foreach (var message in beforeAck ? Array.Empty<WebSocketMessageEnvelope>() : eventFactory(subscribe.TokenId, Endpoint))

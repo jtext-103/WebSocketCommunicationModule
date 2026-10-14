@@ -34,7 +34,7 @@ public override void RegisterEventCallback(Action<EventArg> handler);
 实现要求：
 
 - `ProtocolNames` 必须包含 `"ws"` 和 `"http"`。
-- `"http"` 用于支持 CFET 既有 URI 写法：用户可以用 `http://host:port/resource/path` 订阅事件，模块内部必须转换为 `ws://host:{port + 1}/cfet2/event/v2`。这里的 `"http"` 不代表使用 HTTP 协议传输事件，真实事件传输仍然使用 WebSocket。
+- `"http"` 用于支持 CFET 既有 URI 写法：用户可以用 `http://host:port/resource/path` 订阅事件，模块内部必须转换为 `ws://host:{port + WebSocketPortOffset}/cfet2/event/v2`。这里的 `"http"` 不代表使用 HTTP 协议传输事件，真实事件传输仍然使用 WebSocket。
 - `RegisterEventCallback` 只保存 Core 注入的回调。收到远程事件、连接状态事件时只能调用该回调。
 - `Subscribe` 负责远程订阅、连接池映射和 token 状态维护。
 - `UnSubScribe` 负责取消远程订阅、本地资源清理和连接释放策略。
@@ -113,11 +113,11 @@ expected cfet2.websocket.event v2, but remote did not complete handshake.
   - WebSocket 连接 URI 为 `ws://host:port/cfet2/event/v2`
   - `filter.SourcesAndTypes[0].Source = /resource/path`
 - `http://host:port/resource/path` 是 CFET 支持的标准写法，必须映射为：
-  - Core 使用的 `filter.Host = ws://host:{port + 1}`
-  - WebSocket 连接 URI 为 `ws://host:{port + 1}/cfet2/event/v2`
+  - Core 使用的 `filter.Host = ws://host:{port + WebSocketPortOffset}`
+  - WebSocket 连接 URI 为 `ws://host:{port + WebSocketPortOffset}/cfet2/event/v2`
   - `filter.SourcesAndTypes[0].Source = /resource/path`
 
-CFET 节点占用两个相邻端口：`http` 端口用于资源访问，`ws` 端口用于事件通信，事件端口固定为资源端口 + 1。`WebSocketCM` 必须在 `GetFullHost("http", host, port)` 中执行该转换。
+CFET 节点默认占用两个相邻端口：`http` 端口用于资源访问，`ws` 端口用于事件通信。事件端口为资源端口 + WebSocketPortOffset，默认偏移 1，可在创建 Core 前配置；APP 监听与客户端地址转换使用同一生效快照。HTTP 事件路由由 HttpEventSubscriptionTransport 选择模块，当前标准宿主只支持 WebSocket，选择 MQTT 会明确拒绝启动。`WebSocketCM` 必须在 `GetFullHost("http", host, port)` 中执行该转换。
 
 当前实现区分 Core Host 标识与 WebSocket 连接 URI：
 
@@ -378,7 +378,7 @@ private readonly ClientSubscriptionAggregator subscriptionAggregator;
 - 相同 `endpoint + source + eventType` 的多个本地 token 聚合为一个远端订阅，并使用独立的 `MasterTokenId`。
 - 多规则 `EventFilter` 拆分为多个远端单规则订阅。
 - 取消最后一个本地 token 时，才发送对应 MasterToken 的 Unsubscribe。
-- `PerformanceLevel` 当前不参与客户端聚合键，远端 filter 固定降级为 `PerformanceLevel = 0`。
+- `PerformanceLevel` 不参与客户端聚合键；聚合组保存每个本地 token 的请求等级，远端 filter 使用组内最小等级，并在该等级变化时更新远端订阅。
 - Subscribe 和 UnSubScribe 必须线程安全。
 - 同一连接上的发送必须串行化，避免并发写 WebSocket。
 - 所有网络 I/O 必须有超时。
@@ -573,13 +573,13 @@ var options = new WebSocketCommunicationOptions
 
 - `EventArg.Sample` 的反序列化可能涉及 `ISample` 接口，新模块需要明确 sample 的 JSON 表达方式。
 - 如果直接序列化 `EventArg`，必须保证反序列化后 `Sample.ObjectVal`、`Sample.IsRemote`、`Source`、`EventType`、`Host` 都可用。
-- 当前仅实现 `PerformanceLevel = 0` 的完整 `EventArg` 推送。收到其他值时记录警告并降级为 0。
-- `PerformanceLevel` 当前不参与客户端订阅聚合键；轻量 payload 和按性能等级区分客户端聚合属于后续优化。
+- 当前支持 PerformanceLevel 0 和 1：0 推送完整 EventArg；1 推送 Source、EventType、Value 和 Timestamp。客户端和服务端拒绝 0/1 以外的等级，不自动降级。
+- PerformanceLevel 不参与客户端订阅聚合键，也不参与事件匹配；相同条件的 0/1 订阅共享远端订阅，组内只要有等级 0 成员就请求完整载荷，全为等级 1 时请求精简载荷。
 - **容错与大报文处理**：需要合理配置 ClientWebSocket 和服务端的最大接收缓冲区（如 `ReceiveBufferSize`）。若业务事件包（如包含极大数组或图像数据）超过限制导致底层抛出异常，应记录异常日志并丢弃该消息，切勿让单一的大报文导致整个 `ReceiveLoop` 崩溃退出。
 
-建议第一版先稳定全量 `EventArg` 模式，再增加轻量 payload 模式。
+完整和精简载荷均已实现，正式语义与聚合更新规则见 [PerformanceLevel 实现文档](PerformanceLevel实现文档.md)。
 
-当前实现差距：握手完成后收到非法 JSON、错误协议消息或超大消息时，客户端连接或服务端 session 当前仍可能被关闭。目标行为是记录警告、忽略该条消息并继续处理后续消息；超大分片还需要完整 drain 后再继续接收。相关测试应在实现该容错行为后同步调整。
+当前实现：握手完成后，客户端和服务端对非法 JSON、未知消息类型、错误协议或版本、非法字段及不支持的二进制消息记录 Warn 并丢弃，继续处理后续消息。超大或二进制消息完整 drain 到 EndOfMessage 后才继续接收，拒绝后不再积累 payload；原有连接和订阅保持有效。握手阶段仍严格拒绝坏消息，网络断开、取消与超时仍执行原有关闭或重连流程。
 
 ## 12. 与旧模块的隔离要求
 
@@ -612,7 +612,7 @@ var options = new WebSocketCommunicationOptions
 - 远程 Subscribe 时，Core 只调用 `WebSocketCM.Subscribe(token, filter)`，业务 handler 不传入模块。
 - `token.Dispose()` 会通过 `EventHub.Unsubscribe(...)` 调用 `WebSocketCM.UnSubScribe(token)`。
 - `GetFullHost("ws", host, port)` 返回 Core Host 标识 `ws://host:port`。
-- `GetFullHost("http", host, port)` 返回 Core Host 标识 `ws://host:{port + 1}`，用于支持 `http://...` 订阅写法。
+- `GetFullHost("http", host, port)` 返回 Core Host 标识 `ws://host:{port + WebSocketPortOffset}`，用于支持 `http://...` 订阅写法。
 
 ### 13.2 协议握手测试
 
@@ -669,7 +669,7 @@ var options = new WebSocketCommunicationOptions
 - 相同 `endpoint + source + eventType` 的本地订阅聚合为一个远端 MasterToken。
 - 多规则 filter 拆分为多个远端单规则订阅。
 - 取消最后一个本地 token 时才发送对应 MasterToken 的 Unsubscribe。
-- 不同 `PerformanceLevel` 当前仍聚合到同一客户端远端订阅，并降级为 0。
+- 不同 PerformanceLevel 仍聚合到同一客户端远端订阅，以组内最小等级作为有效等级；验证全为等级 1、混合 0/1 以及成员增删导致等级更新的行为。
 
 ### 13.6 Unsubscribe 测试
 
@@ -781,8 +781,8 @@ var options = new WebSocketCommunicationOptions
 - 重连后重订阅按单条 Subscribe 顺序发送，且相邻发送之间有可配置间隔。
 - SendAsync 超时不会导致全局死锁。
 - fan-out 等待队列达到 `MaxPendingFanOutEvents` 时丢弃新任务并累计计数，`WebSocket fan-out overload` 告警每秒最多一次；不要求慢客户端与健康客户端隔离。
-- 目标行为：接收到超大 JSON 报文时完整 drain 并丢弃该条消息，连接继续工作。当前实现仍可能关闭连接，此测试待实现后调整。
-- 目标行为：握手后的非法 JSON 或错误协议消息只记录警告并忽略。当前实现仍可能关闭连接或 session，此测试待实现后调整。
+- 接收到超大报文或二进制消息时完整 drain 并丢弃，验证分片结束后同一连接继续处理 Pong／事件，已有订阅保持有效。
+- 握手后的非法 JSON、未知消息类型、错误协议／版本或非法字段只记录警告并忽略；验证随后合法消息仍可接收，握手错误仍拒绝。
 - 服务端返回 error 时客户端订阅状态和连接状态一致。
 
 ### 13.14 并发和资源测试
@@ -806,7 +806,7 @@ var options = new WebSocketCommunicationOptions
 3. 实现客户端连接池、版本握手和客户端鉴权字段透传；服务端鉴权作为后续扩展。
 4. 实现 Subscribe 的 Pending/Active 状态和离线 flush。
 5. 实现 UnSubScribe 的本地清理优先策略和发送失败重试。
-6. 实现 receive loop，把远程事件送入注册回调；坏消息和超大报文忽略能力作为待补齐项。
+6. 实现 receive loop，把远程事件送入注册回调；握手后坏消息丢弃、超大及二进制分片排空能力已实现。
 7. 实现心跳、半开连接探测及服务端僵尸会话剔除。
 8. 实现连接状态事件。
 9. 实现断线重连和逐条重订阅，相邻 Subscribe 之间必须有可配置间隔。

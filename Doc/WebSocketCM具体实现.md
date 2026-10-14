@@ -111,7 +111,7 @@ private volatile bool disposed;
 
 ```text
 ws   -> ws://{hostname}:{port}
-http -> ws://{hostname}:{port + 1}
+http -> ws://{hostname}:{port + WebSocketPortOffset}
 其他 -> string.Empty
 ```
 
@@ -119,8 +119,8 @@ http -> ws://{hostname}:{port + 1}
 
 1. 返回值是 Core Host 标识，不包含 `/cfet2/event/v2`。
 2. 真实 WebSocket 连接 URI 由 `RemoteEndpointKey.ToUri()` 统一拼接 `/cfet2/event/v2`。
-3. 用户订阅可以写 `http://host:port/resource/path`；`EventFilter` 解析后应得到 `filter.Host = ws://host:{port + 1}`，`Source = /resource/path`。
-4. CFET 部署占用两个相邻端口：`http` 为资源访问端口，`ws` 为事件端口。事件通信模块只负责把 `http` 写法规范化为对应的 `ws` 事件 Host。
+3. 用户订阅可以写 `http://host:port/resource/path`；`EventFilter` 解析后应得到 `filter.Host = ws://host:{port + WebSocketPortOffset}`，`Source = /resource/path`。
+4. CFET 默认部署占用两个相邻端口，WebSocketPortOffset 默认 1：`http` 为资源访问端口，`ws` 为事件端口。事件通信模块只负责把 `http` 写法规范化为对应的 `ws` 事件 Host。
 
 ### 3.3 `WebSocketCommunicationModule.Events.cs`
 
@@ -319,7 +319,7 @@ public abstract class WebSocketMessageEnvelope
 3. 提供 `DeserializeEnvelope(...)` 和按 `messageType` 分发的 `DeserializeMessage(...)`。
 4. 处理坏 JSON、大报文和缺少 envelope 的错误。
 
-第一版先稳定全量 `EventArg` JSON；`PerformanceLevel = 1` 轻量 payload 后置。
+完整 EventArg JSON 和 PerformanceLevel = 1 精简载荷均已实现；精简载荷包含 Source、EventType、Value、Timestamp，组内按最小等级选择远端载荷。
 
 ## 7. 客户端核心流程
 
@@ -551,7 +551,7 @@ ConnectionStatusEvent.Create(
 
 1. 拆分 `WebSocketCommunicationModule` partial 文件。
 2. 增加 `WebSocketCommunicationOptions`。
-3. 修正 `ProtocolNames` 返回 `["ws", "http"]`，并让 `GetFullHost(...)` 对 `http` 固定返回 `ws://host:{port + 1}/cfet2/event/v2`。
+3. 修正 `ProtocolNames` 返回 `["ws", "http"]`，并让 `GetFullHost(...)` 对 http 返回 `ws://host:{port + WebSocketPortOffset}` 的 Core Host 标识，偏移默认 1；连接 URI 再附加 `/cfet2/event/v2`。
 4. 实现 `RegisterEventCallback` 和 `Dispose` 基本幂等。
 5. 覆盖 Core 注册、Start 幂等、Host 解析测试。
 
@@ -604,7 +604,7 @@ ConnectionStatusEvent.Create(
 
 若需要先尽快形成可运行闭环，最小范围建议为：
 
-1. `GetFullHost` 返回 v2 endpoint。
+1. GetFullHost 返回不含 endpoint path 的 Core Host 标识；连接 URI 由 RemoteEndpointKey 附加 v2 endpoint。
 2. 客户端连接池。
 3. hello/helloAck 版本校验。
 4. subscribe/unsubscribe。
@@ -622,4 +622,4 @@ ConnectionStatusEvent.Create(
 3. 不让客户端根据 `tokenId` 直接调用业务 handler。
 4. 不默认连接旧根路径 `/`。
 5. 不在日志中输出鉴权 token。
-6. 不把 `"http"` 当作事件传输协议；它只是 CFET URI 写法入口，真实事件连接必须使用转换后的 `ws://host:{port + 1}/cfet2/event/v2`。
+6. 不把 `"http"` 当作事件传输协议；它只是 CFET URI 写法入口，真实事件连接必须使用转换后的 `ws://host:{port + WebSocketPortOffset}/cfet2/event/v2`。
