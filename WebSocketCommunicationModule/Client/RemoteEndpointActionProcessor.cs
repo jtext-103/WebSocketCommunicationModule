@@ -77,17 +77,24 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         public void EnqueueSubscribe(Guid masterTokenId, int revision, EventFilter remoteFilter)
         {
+            var logs = new DeferredWebSocketLogs();
+            EnqueueSubscribe(masterTokenId, revision, remoteFilter, logs);
+            logs.Write();
+        }
+
+        internal void EnqueueSubscribe(Guid masterTokenId, int revision, EventFilter remoteFilter, DeferredWebSocketLogs logs)
+        {
             if (disposed || isDisposed())
             {
-                WebSocketLog.Logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
+                logs.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
                 return;
             }
 
             subscriptionStore.RemovePendingUnsubscribe(masterTokenId);
 
-            if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Subscribe, masterTokenId, revision, remoteFilter)))
+            if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Subscribe, masterTokenId, revision, remoteFilter), logs))
             {
-                WebSocketLog.Logger.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
+                logs.Warn($"WebSocket subscribe action enqueue failed: {masterTokenId}");
             }
         }
 
@@ -98,17 +105,24 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         public void EnqueueUnsubscribe(Guid masterTokenId)
         {
+            var logs = new DeferredWebSocketLogs();
+            EnqueueUnsubscribe(masterTokenId, logs);
+            logs.Write();
+        }
+
+        internal void EnqueueUnsubscribe(Guid masterTokenId, DeferredWebSocketLogs logs)
+        {
             if (disposed || isDisposed())
             {
-                WebSocketLog.Logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
+                logs.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
                 return;
             }
 
             removeSubscription(masterTokenId);
 
-            if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Unsubscribe, masterTokenId, 0, null)))
+            if (!TryEnqueue(new RemoteEndpointAction(RemoteEndpointActionKind.Unsubscribe, masterTokenId, 0, null), logs))
             {
-                WebSocketLog.Logger.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
+                logs.Warn($"WebSocket unsubscribe action enqueue failed: {masterTokenId}");
             }
         }
 
@@ -161,7 +175,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
         }
 
-        private bool TryEnqueue(RemoteEndpointAction action)
+        private bool TryEnqueue(RemoteEndpointAction action, DeferredWebSocketLogs logs)
         {
             var count = Interlocked.Increment(ref queuedActionCount);
             if (!actionQueue.Writer.TryWrite(action))
@@ -174,7 +188,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 count > actionQueueWarningThreshold &&
                 Interlocked.CompareExchange(ref queueWarningActive, 1, 0) == 0)
             {
-                WebSocketLog.Logger.Error(
+                logs.Error(
                     $"WebSocket action queue warning: endpoint={endpoint}, " +
                     $"queueLength={count}, threshold={actionQueueWarningThreshold}.");
             }

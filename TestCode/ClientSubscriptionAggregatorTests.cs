@@ -26,6 +26,30 @@ public sealed class ClientSubscriptionAggregatorTests : CFET2Host
     }
 
     [TestMethod]
+    public void ManySharedTokens_LevelChangesAndRemovalsPreserveEarlierPlans()
+    {
+        var aggregator = new ClientSubscriptionAggregator();
+        var tokens = Enumerable.Range(0, 256).Select(_ => CreateToken()).ToArray();
+        var original = aggregator.Subscribe(tokens[0], CreateFilter("/thing/shared", 1));
+        foreach (var token in tokens.Skip(1))
+            Assert.IsTrue(aggregator.Subscribe(token, CreateFilter("/thing/shared", 1)).IsEmpty);
+        var upgrade = aggregator.Subscribe(tokens[0], CreateFilter("/thing/shared", 0));
+        Assert.HasCount(1, upgrade.Actions);
+        Assert.AreEqual(0, upgrade.Actions[0].RemoteFilter!.PerformanceLevel);
+        Assert.IsTrue(aggregator.Subscribe(tokens[1], CreateFilter("/thing/shared", 0)).IsEmpty);
+        Assert.IsTrue(aggregator.Unsubscribe(tokens[0]).IsEmpty);
+        var downgrade = aggregator.Unsubscribe(tokens[1]);
+        Assert.HasCount(1, downgrade.Actions);
+        Assert.AreEqual(1, downgrade.Actions[0].RemoteFilter!.PerformanceLevel);
+        Assert.AreEqual(1, original.Actions[0].RemoteFilter!.PerformanceLevel);
+        Assert.AreEqual(0, upgrade.Actions[0].RemoteFilter!.PerformanceLevel);
+        foreach (var token in tokens.Skip(2).SkipLast(1)) Assert.IsTrue(aggregator.Unsubscribe(token).IsEmpty);
+        var last = aggregator.Unsubscribe(tokens[^1]);
+        Assert.AreEqual(RemoteEndpointActionKind.Unsubscribe, last.Actions.Single().Kind);
+        Assert.AreEqual(0, aggregator.GroupCount);
+    }
+
+    [TestMethod]
     public void Subscribe_SingleRule_ShouldCreateOneSubscribeAction()
     {
         var aggregator = new ClientSubscriptionAggregator();

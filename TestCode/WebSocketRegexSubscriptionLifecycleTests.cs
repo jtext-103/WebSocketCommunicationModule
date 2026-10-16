@@ -104,6 +104,40 @@ public sealed partial class WebSocketRegexSubscriptionLifecycleTests : CFET2Host
     }
 
     [TestMethod]
+    public async Task SessionCleanup_CancelsIndexedRunningQueuedAndRejectedRequestsButKeepsSharedWaiter()
+    {
+        var d = Add(block: true); var second = Add("second"); var third = Add("third");
+        using var m = new WebSocketSubscriptionManager(MyHub, 1, 1, 1, 2);
+        using var a = Session(m); using var b = Session(m);
+        var running = Subscribe(m, a, Guid.NewGuid());
+        try
+        {
+            Assert.IsTrue(d.Entered.Wait(2000));
+            var bToken = Guid.NewGuid();
+            var shared = Subscribe(m, b, bToken);
+            var queued = Subscribe(m, a, Guid.NewGuid(), "/second/.*");
+            var rejected = Subscribe(m, a, Guid.NewGuid(), "/third/.*");
+            Assert.AreEqual("subscriptionPreparationCapacityExceeded", (await rejected).Reason);
+            m.UnsubscribeSession(a.Id);
+            Assert.IsTrue(running.IsCanceled);
+            Assert.IsTrue(queued.IsCanceled);
+            Assert.AreEqual(0, m.QueuedPreparationCount);
+            Assert.AreEqual(1, m.PendingRequestCount);
+            Assert.AreEqual(1, m.RunningPreparationCount);
+            d.Release.Set();
+            await Accepted(shared);
+            Assert.IsTrue(m.IsCurrent(b.Id, bToken, shared));
+            Assert.AreEqual(1, m.RemoteSubscriptionCount);
+            Assert.AreEqual(0, second.Reads);
+            Assert.AreEqual(0, third.Reads);
+            m.UnsubscribeSession(b.Id);
+            Assert.AreEqual(0, m.RemoteSubscriptionCount);
+            Assert.AreEqual(0, m.AggregatedSubscriptionCount);
+        }
+        finally { d.Release.Set(); }
+    }
+
+    [TestMethod]
     public async Task CanceledRunningGetterKeepsCapacityAndQueuedCancellationNeverReads()
     {
         var d = Add(block: true); var second = Add("second"); var third = Add("third");

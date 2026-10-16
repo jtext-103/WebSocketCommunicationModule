@@ -52,6 +52,16 @@ host.MyHub.TryAddThing(new WebSocketCMThing(webSocketCm), "/", "websocketcm");
 - 不要在配置或日志中暴露 token。
 - 源码测试需要 .NET 10 SDK：`dotnet test .\TestCode\TestCode.csproj`。
 
+## 锁范围与并发行为
+
+- 服务端管理锁保留订阅预留、revision 替换、提交、取消及分发队列容量的一致性；过滤器构造和准备线程启动在管理锁外执行。会话请求按 Session 建立索引，断线清理不再扫描其他会话的请求。
+- 聚合组在订阅变化时更新不可变接收者快照，同一事务内每组只更新一次；事件入队引用该版本，后来的订阅者不会收到旧排队事件。发送前仍验证订阅实例。
+- 会话退订、订阅替换及关闭先使订阅状态失效，再在会话锁外释放本地订阅资源。
+- 客户端在生命周期锁外准备过滤器及输出订阅日志；计划生成与入队仍保持顺序。共享组通过计数维护 PerformanceLevel，并复用两种级别的过滤器。
+- 建连信号量只覆盖建连与握手；订阅刷新独立串行，使用容量为 1 的通知队列合并刷新请求，保留 `ResubscribeInterval` 节流。本地订阅动作不等待整批刷新。重连和连接状态回调均不在对应锁内执行。
+- 等待发送锁后重新检查订阅实例与连接 generation；旧连接的迟到结果不能修改新订阅尝试。断线取消旧连接的节流等待，发送超时仍触发重连。
+- 回归覆盖见 `WebSocketLockScopeTests`、`ClientSubscriptionAggregatorTests`、`WebSocketHeartbeatReconnectPhase6Tests`，以及既有分发队列、正则订阅生命周期和端到端测试。测试结果不代表生产负载吞吐量承诺。
+
 ## 文档
 
 - [实现说明与测试边界](<Doc/WebSocketCM 实现说明与测试边界 V1.0.md>)

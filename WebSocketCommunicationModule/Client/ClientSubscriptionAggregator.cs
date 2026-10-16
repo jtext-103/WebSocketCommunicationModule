@@ -10,13 +10,18 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private readonly Dictionary<Guid, LocalSubscriptionBinding> localSubscriptionIndex = new();
         private readonly object syncRoot = new();
 
+        internal sealed record PreparedSubscription(RemoteEndpointKey Endpoint,
+            ClientSubscriptionGroupKey[] Keys, HashSet<ClientSubscriptionGroupKey> KeySet,
+            Dictionary<ClientSubscriptionGroupKey, EventFilter[]> Filters, int PerformanceLevel);
+
         public ClientSubscriptionPlan Subscribe(Token token, EventFilter filter)
         {
-            if (token == null)
-            {
-                throw new ArgumentNullException(nameof(token));
-            }
+            ArgumentNullException.ThrowIfNull(token);
+            return Subscribe(token, Prepare(filter));
+        }
 
+        internal PreparedSubscription Prepare(EventFilter filter)
+        {
             if (filter == null)
             {
                 throw new ArgumentNullException(nameof(filter));
@@ -34,10 +39,30 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 throw new ArgumentException("Remote event filter must include at least one source and event type.", nameof(filter));
             }
 
+            if (filter.PerformanceLevel is not 0 and not 1)
+                throw new ArgumentOutOfRangeException(nameof(filter), $"Unsupported PerformanceLevel: {filter.PerformanceLevel}");
+            var filters = new Dictionary<ClientSubscriptionGroupKey, EventFilter[]>();
+            lock (syncRoot)
+            {
+                foreach (var key in groupKeys)
+                    if (clientSubscriptionGroups.TryGetValue(key, out var group)) filters[key] = group.Filters;
+            }
+            // Regex construction runs outside both aggregation and module lifecycle locks.
+            foreach (var key in groupKeys)
+                if (!filters.ContainsKey(key)) filters[key] = [
+                    CreateSingleRuleRemoteFilter(filter.Host, key, 0),
+                    CreateSingleRuleRemoteFilter(filter.Host, key, 1)];
+            return new(endpoint, groupKeys, groupKeys.ToHashSet(), filters, filter.PerformanceLevel);
+        }
+
+        internal ClientSubscriptionPlan Subscribe(Token token, PreparedSubscription prepared)
+        {
+            var endpoint = prepared.Endpoint;
+            var groupKeys = prepared.Keys;
             lock (syncRoot)
             {
                 var actions = new List<ClientRemoteAction>();
-                var newKeySet = groupKeys.ToHashSet();
+                var newKeySet = prepared.KeySet;
                 localSubscriptionIndex.TryGetValue(token.Id, out var oldBinding);
 
                 if (oldBinding != null)
@@ -52,11 +77,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 var reusedSubscriptions = new List<(RemoteEndpointKey Endpoint, Guid MasterTokenId, int Revision)>();
                 foreach (var groupKey in groupKeys)
                 {
-                    var group = GetOrCreateClientSubscriptionGroup(groupKey, filter, actions);
-                    AddOrUpdateLocalSubscription(group, token.Id, filter.PerformanceLevel, actions);
+                    var actionStart = actions.Count;
+                    var group = GetOrCreateClientSubscriptionGroup(groupKey, prepared, actions);
+                    AddOrUpdateLocalSubscription(group, token.Id, prepared.PerformanceLevel, actions);
                     masterTokenIds.Add(group.MasterTokenId);
-                    if (!actions.Any(action => action.Kind == RemoteEndpointActionKind.Subscribe &&
-                        action.MasterTokenId == group.MasterTokenId))
+                    if (actions.Count == actionStart)
                     {
                         reusedSubscriptions.Add((group.Endpoint, group.MasterTokenId, group.Revision));
                     }
@@ -142,7 +167,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         private ClientSubscriptionGroup GetOrCreateClientSubscriptionGroup(
             ClientSubscriptionGroupKey groupKey,
-            EventFilter sourceFilter,
+            PreparedSubscription prepared,
             ICollection<ClientRemoteAction> actions)
         {
             if (clientSubscriptionGroups.TryGetValue(groupKey, out var existingGroup))
@@ -151,13 +176,15 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
 
             var masterTokenId = Guid.NewGuid();
-            var remoteFilter = CreateSingleRuleRemoteFilter(sourceFilter, groupKey);
+            var filters = prepared.Filters[groupKey];
+            var remoteFilter = filters[prepared.PerformanceLevel];
             var group = new ClientSubscriptionGroup
             {
                 MasterTokenId = masterTokenId,
                 Key = groupKey,
                 RemoteFilter = remoteFilter,
-                EffectivePerformanceLevel = sourceFilter.PerformanceLevel,
+                Filters = filters,
+                EffectivePerformanceLevel = prepared.PerformanceLevel,
                 CreatedAtUtc = DateTime.UtcNow,
             };
 
@@ -187,7 +214,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 }
 
                 var oldEffectivePerformanceLevel = group.EffectivePerformanceLevel;
-                group.LocalTokenIds.TryRemove(localTokenId, out _);
+                if (group.LocalTokenIds.TryRemove(localTokenId, out var oldLevel) && oldLevel == 0)
+                    group.FullPerformanceTokenCount--;
                 if (!group.LocalTokenIds.IsEmpty)
                 {
                     UpdateEffectivePerformanceLevelIfNeeded(group, oldEffectivePerformanceLevel, actions);
@@ -212,7 +240,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             ICollection<ClientRemoteAction> actions)
         {
             var oldEffectivePerformanceLevel = group.EffectivePerformanceLevel;
+            if (group.LocalTokenIds.TryGetValue(localTokenId, out var oldLevel) && oldLevel == 0)
+                group.FullPerformanceTokenCount--;
             group.LocalTokenIds[localTokenId] = performanceLevel;
+            if (performanceLevel == 0) group.FullPerformanceTokenCount++;
             UpdateEffectivePerformanceLevelIfNeeded(group, oldEffectivePerformanceLevel, actions);
         }
 
@@ -226,7 +257,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 return;
             }
 
-            var newEffectivePerformanceLevel = group.LocalTokenIds.Values.Min();
+            var newEffectivePerformanceLevel = group.FullPerformanceTokenCount > 0 ? 0 : 1;
             if (newEffectivePerformanceLevel == oldEffectivePerformanceLevel)
             {
                 return;
@@ -234,10 +265,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
             group.EffectivePerformanceLevel = newEffectivePerformanceLevel;
             group.Revision++;
-            group.RemoteFilter = CreateSingleRuleRemoteFilter(
-                group.RemoteFilter.Host,
-                group.Key,
-                newEffectivePerformanceLevel);
+            group.RemoteFilter = group.Filters[newEffectivePerformanceLevel];
             actions.Add(new ClientRemoteAction
             {
                 Kind = RemoteEndpointActionKind.Subscribe,
@@ -256,16 +284,6 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 .Where(rule => !string.IsNullOrWhiteSpace(rule.Source) && !string.IsNullOrWhiteSpace(rule.EventType))
                 .Select(rule => new ClientSubscriptionGroupKey(endpoint, rule.Source, rule.EventType))
                 .Distinct();
-        }
-
-        private static EventFilter CreateSingleRuleRemoteFilter(
-            EventFilter sourceFilter,
-            ClientSubscriptionGroupKey groupKey)
-        {
-            return CreateSingleRuleRemoteFilter(
-                sourceFilter.Host,
-                groupKey,
-                sourceFilter.PerformanceLevel);
         }
 
         private static EventFilter CreateSingleRuleRemoteFilter(

@@ -2,6 +2,23 @@ using Jtext103.CFET2.Core.Log;
 
 namespace Jtext103.CFET2.WebSocketCommunicationModule
 {
+    // Callers collect messages while committing ordered state, then invoke providers
+    // after releasing their locks. The collector belongs to a single operation.
+    internal sealed class DeferredWebSocketLogs
+    {
+        private readonly List<(bool Error, string Message)> messages = new();
+        internal void Error(string message) => messages.Add((true, message));
+        internal void Warn(string message) => messages.Add((false, message));
+        internal void Write()
+        {
+            foreach (var (error, message) in messages)
+            {
+                if (error) WebSocketLog.Logger.Error(message);
+                else WebSocketLog.Logger.Warn(message);
+            }
+        }
+    }
+
     internal static class WebSocketLog
     {
         private static ICfet2Logger logger = EmptyLogger.Instance;

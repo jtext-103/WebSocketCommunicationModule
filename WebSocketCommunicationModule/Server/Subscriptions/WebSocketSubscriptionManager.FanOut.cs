@@ -53,7 +53,7 @@ internal sealed partial class WebSocketSubscriptionManager
             }
             else
             {
-                var item = new FanOutWorkItem(group, eventArg, group.Subscribers.Values.ToArray());
+                var item = new FanOutWorkItem(group, eventArg, group.SubscriberSnapshot);
                 if (!fanOutQueue.Writer.TryWrite(item))
                     throw new InvalidOperationException("Open fan-out queue rejected an available slot.");
                 pendingFanOutEvents++;

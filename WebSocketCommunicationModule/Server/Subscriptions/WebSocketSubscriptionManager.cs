@@ -37,6 +37,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         }
         private readonly Dictionary<ServerSubscriptionKey, Preparation> preparations = new();
         private readonly Dictionary<RemoteSubscriptionKey, Request> requests = new();
+        private readonly Dictionary<Guid, HashSet<RemoteSubscriptionKey>> sessionRequests = new();
+        private readonly HashSet<AggregatedServerSubscription> changedGroups = new();
         private readonly LinkedList<Preparation> queue = new();
         private readonly int maxPreparations, maxPending;
         private int runningPreparations, pendingRequests;
@@ -58,25 +60,54 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         public Task<ServerSubscribeResult> SubscribeAsync(WebSocketSession session, Guid remoteTokenId,
             int revision, EventFilter remoteFilter)
         {
+            var task = ReserveSubscription(session, remoteTokenId, revision, remoteFilter, out var cleanup);
+            cleanup.Dispose();
+            return task;
+        }
+
+        internal Task<ServerSubscribeResult> ReserveSubscription(WebSocketSession session, Guid remoteTokenId,
+            int revision, EventFilter remoteFilter, out IDisposable detached)
+        {
             ArgumentNullException.ThrowIfNull(session);
             ArgumentNullException.ThrowIfNull(remoteFilter);
             var keys = remoteFilter.SourcesAndTypes.Select(r => new ServerSubscriptionKey(r.Source, r.EventType)).Distinct().ToArray();
             var signature = CreateFilterSignature(keys);
+            var keySet = keys.ToHashSet();
             var key = new RemoteSubscriptionKey(session.Id, remoteTokenId);
             var cleanup = new List<AggregatedServerSubscription>();
+            detached = new DetachedGroups(this, cleanup);
+            var filters = new Dictionary<ServerSubscriptionKey, EventFilter>();
+            lock (syncRoot)
+            {
+                ThrowIfDisposed();
+                var existing = ExistingRevisionResult(key, revision, signature, remoteFilter.PerformanceLevel);
+                if (existing != null) return existing;
+                foreach (var groupKey in keys)
+                    if (preparations.TryGetValue(groupKey, out var prep)) filters[groupKey] = prep.Group.LocalFilter;
+            }
+            Exception? validationError = null;
+            try
+            {
+                if (keys.Length == 0) throw new ArgumentException("Filter must contain at least one source/type.");
+                if (remoteFilter.PerformanceLevel is not 0 and not 1) throw new ArgumentException("Unsupported PerformanceLevel: " + remoteFilter.PerformanceLevel);
+                foreach (var groupKey in keys)
+                    if (!filters.ContainsKey(groupKey))
+                        filters[groupKey] = new EventFilter(groupKey.Source, groupKey.EventType, 0, string.Empty);
+            }
+            catch (Exception ex) { validationError = ex; }
+            List<Preparation> starts;
             Task<ServerSubscribeResult> task;
             lock (syncRoot)
             {
                 ThrowIfDisposed();
+                // State may have changed while missing filters were constructed.
+                var existing = ExistingRevisionResult(key, revision, signature, remoteFilter.PerformanceLevel);
+                if (existing != null) return existing;
                 if (requests.TryGetValue(key, out var previous))
                 {
-                    if (revision < previous.Subscriber.Revision) return Task.FromResult(new ServerSubscribeResult(revision, false, "staleRevision"));
-                    if (revision == previous.Subscriber.Revision)
-                        return previous.Subscriber.FilterSignature == signature && previous.Subscriber.PerformanceLevel == remoteFilter.PerformanceLevel
-                            ? previous.Completion.Task : Task.FromResult(new ServerSubscribeResult(revision, false, "revisionConflict"));
                     // Keep shared reservations until the replacement has acquired them. In particular,
                     // a performance-only update must not restart an in-flight initial read.
-                    foreach (var prep in previous.Needs.Where(p => !keys.Contains(p.Key)).ToArray())
+                    foreach (var prep in previous.Needs.Where(p => !keySet.Contains(p.Key)).ToArray())
                     {
                         previous.Needs.Remove(prep);
                         prep.Waiters.Remove(previous);
@@ -86,13 +117,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 var request = new Request { Key = key, Subscriber = new RemoteSubscriber(session.Id, remoteTokenId,
                     session, signature, remoteFilter.PerformanceLevel, revision) };
                 requests[key] = request;
+                if (!sessionRequests.TryGetValue(session.Id, out var sessionKeys))
+                    sessionRequests.Add(session.Id, sessionKeys = new());
+                sessionKeys.Add(key);
                 task = request.Completion.Task;
                 try
                 {
-                    if (keys.Length == 0) throw new ArgumentException("Filter must contain at least one source/type.");
-                    if (remoteFilter.PerformanceLevel is not 0 and not 1) throw new ArgumentException("Unsupported PerformanceLevel: " + remoteFilter.PerformanceLevel);
-                    // Compile before reserving any group, including when all groups would be reused.
-                    var filters = keys.ToDictionary(k => k, k => new EventFilter(k.Source, k.EventType, 0, string.Empty));
+                    // Preserve revision/idempotency results before reporting lock-free validation.
+                    if (validationError != null) throw validationError;
                     var missing = keys.Count(k => !preparations.ContainsKey(k));
                     var waits = keys.Any(k => !preparations.TryGetValue(k, out var p) || !p.Ready);
                     if (waits && (pendingRequests - (previous?.Pending == true ? 1 : 0) >= (long)maxPending + maxPreparations ||
@@ -115,18 +147,31 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 }
                 catch (Exception ex) { Fail(request, ex.Message, cleanup); }
                 if (previous != null) CancelRequest(previous, cleanup);
-                StartQueued();
+                RefreshSnapshots();
+                starts = ReserveQueued();
             }
-            DisposeGroups(cleanup);
+            StartPreparations(starts);
             return task;
+        }
+
+        // Called under syncRoot both before validation and before committing reservations.
+        private Task<ServerSubscribeResult>? ExistingRevisionResult(RemoteSubscriptionKey key, int revision,
+            string signature, int performanceLevel)
+        {
+            if (!requests.TryGetValue(key, out var previous) || revision > previous.Subscriber.Revision) return null;
+            if (revision < previous.Subscriber.Revision)
+                return Task.FromResult(new ServerSubscribeResult(revision, false, "staleRevision"));
+            return previous.Subscriber.FilterSignature == signature && previous.Subscriber.PerformanceLevel == performanceLevel
+                ? previous.Completion.Task : Task.FromResult(new ServerSubscribeResult(revision, false, "revisionConflict"));
         }
 
         public ServerSubscribeResult Subscribe(WebSocketSession session, Guid token, int revision, EventFilter filter) =>
             SubscribeAsync(session, token, revision, filter).GetAwaiter().GetResult();
         public ServerSubscribeResult Subscribe(WebSocketSession session, Guid token, EventFilter filter) => Subscribe(session, token, 0, filter);
 
-        private void StartQueued()
+        private List<Preparation> ReserveQueued()
         {
+            var starts = new List<Preparation>();
             while (!disposed && runningPreparations < maxPreparations && queue.First != null)
             {
                 var prep = queue.First.Value;
@@ -134,16 +179,36 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 prep.QueueNode = null;
                 prep.Running = true;
                 runningPreparations++;
-                // Bounded blocking workers keep the shared timer/receive pool available for control traffic.
-                _ = Task.Factory.StartNew(() => Prepare(prep), CancellationToken.None,
-                    TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                starts.Add(prep);
+            }
+            return starts;
+        }
+        private void StartPreparations(List<Preparation> starts)
+        {
+            foreach (var prep in starts)
+            {
+                try
+                {
+                    // Reserve capacity under syncRoot; start blocking workers outside it.
+                    _ = Task.Factory.StartNew(() => Prepare(prep), CancellationToken.None,
+                        TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                }
+                catch (Exception ex) { CompletePreparation(prep, ex); }
             }
         }
         private void Prepare(Preparation prep)
         {
             Exception? error = null;
-            try { SubscribeLocal(prep.Key, prep.Group); }
+            lock (syncRoot)
+            {
+                if (prep.Removed || disposed) error = new OperationCanceledException();
+            }
+            try { if (error == null) SubscribeLocal(prep.Key, prep.Group); }
             catch (Exception ex) { error = ex; }
+            CompletePreparation(prep, error);
+        }
+        private void CompletePreparation(Preparation prep, Exception? error)
+        {
             var cleanup = new List<AggregatedServerSubscription>();
             lock (syncRoot)
             {
@@ -160,9 +225,15 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                     foreach (var request in prep.Waiters.ToArray()) TryCommit(request, cleanup);
                     RemoveUnused(prep, cleanup);
                 }
+                RefreshSnapshots();
             }
             try { DisposeGroups(cleanup); }
-            finally { lock (syncRoot) { runningPreparations--; StartQueued(); } }
+            finally
+            {
+                List<Preparation> starts;
+                lock (syncRoot) { runningPreparations--; starts = ReserveQueued(); }
+                StartPreparations(starts);
+            }
         }
         private void TryCommit(Request request, List<AggregatedServerSubscription> cleanup)
         {
@@ -172,6 +243,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             foreach (var prep in request.Needs)
             {
                 prep.Group.Subscribers[request.Key] = request.Subscriber;
+                changedGroups.Add(prep.Group);
                 aggregatedSubscriptions[prep.Key] = prep.Group;
             }
             remoteIndex[request.Key] = next;
@@ -208,30 +280,68 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         private void RemoveSubscriber(ServerSubscriptionKey key, RemoteSubscriptionKey remote, List<AggregatedServerSubscription> cleanup)
         {
             if (!preparations.TryGetValue(key, out var prep)) return;
-            prep.Group.Subscribers.TryRemove(remote, out _);
+            if (prep.Group.Subscribers.TryRemove(remote, out _)) changedGroups.Add(prep.Group);
             RemoveUnused(prep, cleanup);
+        }
+        private void RefreshSnapshots()
+        {
+            foreach (var group in changedGroups) group.RefreshSubscriberSnapshot();
+            changedGroups.Clear();
         }
         private void UnsubscribeCore(RemoteSubscriptionKey key, List<AggregatedServerSubscription> cleanup)
         {
             if (requests.Remove(key, out var request)) CancelRequest(request, cleanup);
+            if (sessionRequests.TryGetValue(key.SessionId, out var sessionKeys))
+            {
+                sessionKeys.Remove(key);
+                if (sessionKeys.Count == 0) sessionRequests.Remove(key.SessionId);
+            }
             if (remoteIndex.TryRemove(key, out var keys))
                 foreach (var groupKey in keys) RemoveSubscriber(groupKey, key, cleanup);
         }
         public void Unsubscribe(Guid sessionId, Guid remoteTokenId)
         {
+            using var cleanup = DetachSubscription(sessionId, remoteTokenId);
+        }
+        internal IDisposable DetachSubscription(Guid sessionId, Guid remoteTokenId)
+        {
             var cleanup = new List<AggregatedServerSubscription>();
-            lock (syncRoot) { UnsubscribeCore(new RemoteSubscriptionKey(sessionId, remoteTokenId), cleanup); StartQueued(); }
-            DisposeGroups(cleanup);
+            List<Preparation> starts;
+            lock (syncRoot)
+            {
+                UnsubscribeCore(new RemoteSubscriptionKey(sessionId, remoteTokenId), cleanup);
+                RefreshSnapshots();
+                starts = ReserveQueued();
+            }
+            StartPreparations(starts);
+            return new DetachedGroups(this, cleanup);
         }
         public void UnsubscribeSession(Guid sessionId)
         {
+            using var cleanup = DetachSession(sessionId);
+        }
+        internal IDisposable DetachSession(Guid sessionId)
+        {
             var cleanup = new List<AggregatedServerSubscription>();
+            List<Preparation> starts;
             lock (syncRoot)
             {
-                foreach (var key in requests.Keys.Where(k => k.SessionId == sessionId).ToArray()) UnsubscribeCore(key, cleanup);
-                StartQueued();
+                if (sessionRequests.TryGetValue(sessionId, out var sessionKeys))
+                    foreach (var key in sessionKeys.ToArray()) UnsubscribeCore(key, cleanup);
+                RefreshSnapshots();
+                starts = ReserveQueued();
             }
-            DisposeGroups(cleanup);
+            StartPreparations(starts);
+            return new DetachedGroups(this, cleanup);
+        }
+        private sealed class DetachedGroups(WebSocketSubscriptionManager owner, List<AggregatedServerSubscription> groups) : IDisposable
+        {
+            private List<AggregatedServerSubscription>? pending = groups;
+            public void Dispose()
+            {
+                var cleanup = Interlocked.Exchange(ref pending, null);
+                if (cleanup != null) owner.DisposeGroups(cleanup);
+            }
         }
         public void Dispose()
         {
@@ -242,6 +352,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 disposed = true;
                 CloseFanOutQueue();
                 foreach (var key in requests.Keys.ToArray()) UnsubscribeCore(key, cleanup);
+                RefreshSnapshots();
             }
             StopFanOut();
             DisposeGroups(cleanup);

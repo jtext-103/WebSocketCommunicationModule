@@ -33,7 +33,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 () => disposed,
                 (tokenId, revision, filter) => AddOrUpdateSubscription(tokenId, revision, filter),
                 RemoveSubscription,
-                EnsureConnectedAsync,
+                connection.RequestRefreshAsync,
                 SendUnsubscribeAsync,
                 subscriptionStore,
                 endpoint,
@@ -64,6 +64,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             actionProcessor.EnqueueSubscribe(masterTokenId, revision, remoteFilter);
         }
+
+        internal void EnqueueSubscribe(Guid masterTokenId, int revision, EventFilter remoteFilter, DeferredWebSocketLogs logs) =>
+            actionProcessor.EnqueueSubscribe(masterTokenId, revision, remoteFilter, logs);
+
+        internal void EnqueueUnsubscribe(Guid masterTokenId, DeferredWebSocketLogs logs) =>
+            actionProcessor.EnqueueUnsubscribe(masterTokenId, logs);
 
         public void EnqueueSubscribe(Guid masterTokenId, EventFilter remoteFilter)
         {

@@ -13,7 +13,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private readonly Action<DateTime> setLastReceivedAtUtc;
         private readonly Action<RemoteEventMessage> remoteEventReceived;
         private readonly Func<bool> isDisposed;
-        private readonly Action<Exception> connectionFailure;
+        private readonly Action<Exception, long> connectionFailure;
 
 
         public RemoteEndpointMessageHandler(
@@ -24,7 +24,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             Action<DateTime> setLastReceivedAtUtc,
             Action<RemoteEventMessage> remoteEventReceived,
             Func<bool> isDisposed,
-            Action<Exception> connectionFailure)
+            Action<Exception> connectionFailure,
+            Action<Exception, long>? generationFailure = null)
         {
             this.subscriptionStore = subscriptionStore;
             this.isCurrentGeneration = isCurrentGeneration;
@@ -33,7 +34,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             this.setLastReceivedAtUtc = setLastReceivedAtUtc;
             this.remoteEventReceived = remoteEventReceived;
             this.isDisposed = isDisposed;
-            this.connectionFailure = connectionFailure;
+            this.connectionFailure = generationFailure ?? ((exception, _) => connectionFailure(exception));
 
         }
 
@@ -83,7 +84,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             {
                 if (!isDisposed() && isCurrentGeneration(generation))
                 {
-                    connectionFailure(ex);
+                    connectionFailure(ex, generation);
                 }
             }
         }

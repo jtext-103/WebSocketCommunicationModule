@@ -15,5 +15,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         public EventFilter LocalFilter { get; init; } = new();
 
         public ConcurrentDictionary<RemoteSubscriptionKey, RemoteSubscriber> Subscribers { get; } = new();
+
+        // Replaced under the manager lock, never mutated after publication. Queue items
+        // retain this version so later subscriptions cannot inherit earlier events.
+        internal RemoteSubscriber[] SubscriberSnapshot { get; private set; } = [];
+
+        internal void RefreshSubscriberSnapshot() => SubscriberSnapshot = Subscribers.Values.ToArray();
     }
 }

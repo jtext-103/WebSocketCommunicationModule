@@ -116,16 +116,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 
             cts.Cancel();
 
+            IDisposable cleanup;
             lock (lifecycleLock)
             {
-                foreach (var remoteTokenId in remoteTokens.Keys)
-                {
-                    subscriptionManager.Unsubscribe(Id, remoteTokenId);
-                }
-
                 remoteTokens.Clear();
-                subscriptionManager.UnsubscribeSession(Id);
+                cleanup = subscriptionManager.DetachSession(Id);
             }
+            cleanup.Dispose();
 
             try
             {
@@ -168,22 +165,27 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
         {
             Task<ServerSubscribeResult> preparation;
             var validationFailure = false;
-            lock (lifecycleLock)
+            IDisposable? cleanup = null;
+            try
             {
-                if (Volatile.Read(ref disposed) != 0) return;
-                try
+                lock (lifecycleLock)
                 {
-                    preparation = subscriptionManager.SubscribeAsync(this, message.TokenId, message.Revision,
-                        message.Filter ?? new EventFilter());
+                    if (Volatile.Read(ref disposed) != 0) return;
+                    try
+                    {
+                        preparation = subscriptionManager.ReserveSubscription(this, message.TokenId, message.Revision,
+                            message.Filter ?? new EventFilter(), out cleanup);
+                    }
+                    catch (Exception ex)
+                    {
+                        validationFailure = true;
+                        preparation = Task.FromResult(new ServerSubscribeResult(message.Revision, false, ex.Message));
+                    }
+                    // Retransmissions wait for the same outcome without accumulating continuations.
+                    if (!pendingAcks.Add(preparation)) return;
                 }
-                catch (Exception ex)
-                {
-                    validationFailure = true;
-                    preparation = Task.FromResult(new ServerSubscribeResult(message.Revision, false, ex.Message));
-                }
-                // Retransmissions wait for the same outcome without accumulating continuations.
-                if (!pendingAcks.Add(preparation)) return;
             }
+            finally { cleanup?.Dispose(); }
             _ = CompleteSubscribeAsync(message.TokenId, preparation, cancellationToken, validationFailure);
         }
 
@@ -216,11 +218,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
 
         private async Task UnsubscribeAsync(Guid remoteTokenId, CancellationToken cancellationToken)
         {
+            IDisposable cleanup;
             lock (lifecycleLock)
             {
                 remoteTokens.TryRemove(remoteTokenId, out _);
-                subscriptionManager.Unsubscribe(Id, remoteTokenId);
+                cleanup = subscriptionManager.DetachSubscription(Id, remoteTokenId);
             }
+            cleanup.Dispose();
 
             await Task.CompletedTask.ConfigureAwait(false);
         }

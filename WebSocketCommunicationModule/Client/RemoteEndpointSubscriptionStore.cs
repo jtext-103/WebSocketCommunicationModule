@@ -125,9 +125,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         }
 
         public bool TryMarkSubscribeSending(Guid masterTokenId)
+            => TryMarkSubscribeSending(masterTokenId, out _);
+
+        internal bool TryMarkSubscribeSending(Guid masterTokenId, out RemoteSubscriptionEntry? entry)
         {
             lock (syncRoot)
             {
+                entry = null;
                 if (!subscriptions.TryGetValue(masterTokenId, out var current) ||
                     current.State != SubscriptionState.Pending ||
                     current.SubscribeSentAtUtc != null ||
@@ -137,7 +141,36 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 }
 
                 current.SubscribeSendInProgress = true;
+                entry = current;
                 return true;
+            }
+        }
+
+        internal bool IsCurrent(RemoteSubscriptionEntry entry)
+        {
+            lock (syncRoot) return subscriptions.TryGetValue(entry.TokenId, out var current)
+                && ReferenceEquals(current, entry) && current.State == SubscriptionState.Pending;
+        }
+
+        internal void MarkSubscribeSent(RemoteSubscriptionEntry entry, DateTime sentAtUtc)
+        {
+            lock (syncRoot)
+            {
+                if (!subscriptions.TryGetValue(entry.TokenId, out var current) ||
+                    !ReferenceEquals(current, entry) || current.State != SubscriptionState.Pending) return;
+                current.SubscribeSentAtUtc = sentAtUtc;
+                current.SubscribeSendInProgress = false;
+            }
+        }
+
+        internal void MarkSubscribeSendFailed(RemoteSubscriptionEntry entry, string reason)
+        {
+            lock (syncRoot)
+            {
+                if (!subscriptions.TryGetValue(entry.TokenId, out var current) || !ReferenceEquals(current, entry)) return;
+                current.LastError = reason;
+                current.SubscribeSentAtUtc = null;
+                current.SubscribeSendInProgress = false;
             }
         }
 
@@ -173,10 +206,18 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             out EventFilter? filter,
             out int revision)
         {
+            var prepared = TryPrepareRetryEntry(masterTokenId, maxRetryCount, out var entry);
+            filter = entry?.Filter;
+            revision = entry?.Revision ?? 0;
+            return prepared;
+        }
+
+        internal bool TryPrepareRetryEntry(Guid masterTokenId, int maxRetryCount,
+            out RemoteSubscriptionEntry? entry)
+        {
             lock (syncRoot)
             {
-                filter = null;
-                revision = 0;
+                entry = null;
                 if (!subscriptions.TryGetValue(masterTokenId, out var current) ||
                     current.State != SubscriptionState.Pending ||
                     current.SubscribeSentAtUtc == null ||
@@ -188,8 +229,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
                 current.SubscribeRetryCount++;
                 current.SubscribeSendInProgress = true;
-                filter = current.Filter;
-                revision = current.Revision;
+                entry = current;
                 return true;
             }
         }
@@ -312,15 +352,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             lock (syncRoot)
             {
-                foreach (var entry in subscriptions.Values)
+                foreach (var entry in subscriptions.Values.ToArray())
                 {
                     if (entry.State == SubscriptionState.Active || entry.State == SubscriptionState.Pending)
                     {
-                        entry.State = SubscriptionState.Pending;
-                        entry.ActivatedAtUtc = null;
-                        entry.SubscribeSentAtUtc = null;
-                        entry.SubscribeRetryCount = 0;
-                        entry.SubscribeSendInProgress = false;
+                        // A send finishing on the old connection must not mark the new
+                        // attempt as sent or clear its in-progress flag.
+                        subscriptions[entry.TokenId] = new RemoteSubscriptionEntry
+                        {
+                            TokenId = entry.TokenId, Endpoint = entry.Endpoint, Filter = entry.Filter,
+                            Revision = entry.Revision, State = SubscriptionState.Pending,
+                            CreatedAtUtc = entry.CreatedAtUtc, LastAcceptedRevision = entry.LastAcceptedRevision,
+                            LastError = entry.LastError,
+                        };
                     }
                 }
             }

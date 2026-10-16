@@ -33,6 +33,153 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
     }
 
     [TestMethod]
+    public async Task ConnectionFailure_CancelsOldPacingWaitAndResubscribesOnNewSocket()
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        var delay = new FirstPacingDelay();
+        using var client = new RemoteEndpointClient(RemoteEndpointKey.Parse(server.Endpoint), new WebSocketCommunicationOptions
+        {
+            HeartbeatInterval = TimeSpan.Zero, HeartbeatTimeout = TimeSpan.Zero,
+            ResubscribeInterval = FirstPacingDelay.Interval, DelayProvider = delay,
+            ReconnectPolicy = FastReconnectPolicy(),
+        });
+        var token = Guid.NewGuid();
+        client.EnqueueSubscribe(token, CreateFilter(server.Endpoint));
+        await delay.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await server.SimulateSendFailureAsync("/thing/status", "Changed", 1);
+        Assert.IsTrue(await WaitUntilAsync(() => server.AcceptedCount >= 2 && server.SubscribeMessages.Count >= 2));
+        Assert.IsTrue(delay.Cancelled);
+        Assert.AreEqual(token, server.SubscribeMessages.Last().TokenId);
+        Assert.AreEqual(RemoteConnectionState.Connected, client.State);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task SubscribeWaitingForSendGate_DoesNotSendRemovedOrReplacedAttempt(bool remove)
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        using var client = new RemoteEndpointClient(RemoteEndpointKey.Parse(server.Endpoint), new WebSocketCommunicationOptions
+        {
+            HeartbeatInterval = TimeSpan.Zero, HeartbeatTimeout = TimeSpan.Zero, ResubscribeInterval = TimeSpan.Zero,
+        });
+        var initial = Guid.NewGuid();
+        client.EnqueueSubscribe(initial, CreateFilter(server.Endpoint));
+        Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(initial)?.State == SubscriptionState.Active));
+        var connection = (RemoteEndpointConnection)typeof(RemoteEndpointClient)
+            .GetField("connection", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+        var sendGate = (SemaphoreSlim)typeof(RemoteEndpointConnection)
+            .GetField("sendLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(connection)!;
+        await sendGate.WaitAsync();
+        var token = Guid.NewGuid();
+        try
+        {
+            client.EnqueueSubscribe(token, 0, CreateFilter(server.Endpoint, "/thing/replaced"));
+            Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(token)?.SubscribeSendInProgress == true));
+            if (remove) client.EnqueueUnsubscribe(token);
+            else client.EnqueueSubscribe(token, 1, CreateFilter(server.Endpoint, "/thing/replaced", 1));
+            Assert.IsTrue(await WaitUntilAsync(() => remove ? client.GetSubscription(token) == null : client.GetSubscription(token)?.Revision == 1));
+        }
+        finally { sendGate.Release(); }
+        await connection.EnsureConnectedAsync().WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.IsFalse(server.SubscribeMessages.Any(m => m.TokenId == token && m.Revision == 0));
+        if (!remove) Assert.IsTrue(await WaitUntilAsync(() => server.SubscribeMessages.Any(m => m.TokenId == token && m.Revision == 1)));
+    }
+
+    [TestMethod]
+    public async Task SubscribeSendTimeout_RefreshWorkerRecoversAndProcessesLaterUpdates()
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        using var client = new RemoteEndpointClient(RemoteEndpointKey.Parse(server.Endpoint), new WebSocketCommunicationOptions
+        {
+            HeartbeatInterval = TimeSpan.Zero, HeartbeatTimeout = TimeSpan.Zero, ResubscribeInterval = TimeSpan.Zero,
+            SendTimeout = TimeSpan.FromMilliseconds(100), ReconnectPolicy = FastReconnectPolicy(),
+        });
+        var initial = Guid.NewGuid();
+        client.EnqueueSubscribe(initial, CreateFilter(server.Endpoint));
+        Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(initial)?.State == SubscriptionState.Active));
+        var connection = (RemoteEndpointConnection)typeof(RemoteEndpointClient)
+            .GetField("connection", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+        var sendGate = (SemaphoreSlim)typeof(RemoteEndpointConnection)
+            .GetField("sendLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(connection)!;
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.ConnectionStatusChanged += (_, status) =>
+        {
+            if (status.EventType == ConnectionStatusEvent.Disconnected) failed.TrySetResult();
+        };
+        await sendGate.WaitAsync();
+        var second = Guid.NewGuid();
+        try
+        {
+            client.EnqueueSubscribe(second, CreateFilter(server.Endpoint, "/thing/second"));
+            await failed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+        finally { sendGate.Release(); }
+        Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(second)?.State == SubscriptionState.Active));
+        var later = Guid.NewGuid();
+        client.EnqueueSubscribe(later, CreateFilter(server.Endpoint, "/thing/later"));
+        Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(later)?.State == SubscriptionState.Active));
+        Assert.IsFalse(((Task)typeof(RemoteEndpointConnection).GetField("refreshTask", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(connection)!).IsCompleted);
+    }
+
+    [TestMethod]
+    public async Task SubscriptionPacing_DoesNotHoldConnectGateOrDelayOrderedLocalUpdates()
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        var delay = new ControlledDelayProvider();
+        using var client = new RemoteEndpointClient(RemoteEndpointKey.Parse(server.Endpoint), new WebSocketCommunicationOptions
+        {
+            HeartbeatInterval = TimeSpan.Zero, HeartbeatTimeout = TimeSpan.Zero,
+            SubscribeAckTimeout = TimeSpan.FromSeconds(30),
+            ResubscribeInterval = TimeSpan.FromMilliseconds(50), DelayProvider = delay,
+        });
+        var first = Guid.NewGuid();
+        var removed = Guid.NewGuid();
+        client.EnqueueSubscribe(first, 0, CreateFilter(server.Endpoint));
+        try
+        {
+            Assert.IsTrue(await WaitUntilAsync(() => delay.DelayCount > 0));
+            var connection = (RemoteEndpointConnection)typeof(RemoteEndpointClient)
+                .GetField("connection", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(client)!;
+            var connectGate = (SemaphoreSlim)typeof(RemoteEndpointConnection)
+                .GetField("connectLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(connection)!;
+            Assert.AreEqual(1, connectGate.CurrentCount, "Pacing must not own the connection gate.");
+            client.EnqueueSubscribe(removed, 0, CreateFilter(server.Endpoint, "/thing/removed"));
+            client.EnqueueSubscribe(first, 1, CreateFilter(server.Endpoint, performanceLevel: 1));
+            client.EnqueueUnsubscribe(removed);
+            Assert.IsTrue(await WaitUntilAsync(() => client.GetSubscription(first)?.Revision == 1 &&
+                client.GetSubscription(removed) == null && client.GetDiagnosticStatus().ActionQueueLength == 0));
+            delay.ReleaseAll();
+            Assert.IsTrue(await WaitUntilAsync(() => server.SubscribeMessages.Any(m => m.TokenId == first && m.Revision == 1)));
+            await connection.EnsureConnectedAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.IsFalse(server.SubscribeMessages.Any(m => m.TokenId == removed));
+            Assert.AreEqual(1, server.AcceptedCount);
+            Assert.HasCount(2, server.SubscribeMessages.Where(m => m.TokenId == first).ToArray());
+        }
+        finally { delay.ReleaseAll(); }
+    }
+
+    [TestMethod]
+    public async Task ConnectedCallback_CanEnsureConnectionAgainWithoutWaitingForItsOwnGate()
+    {
+        using var server = Phase6Server.Start(respondToPing: true);
+        using var client = new RemoteEndpointClient(RemoteEndpointKey.Parse(server.Endpoint), new WebSocketCommunicationOptions
+        {
+            HeartbeatInterval = TimeSpan.Zero, HeartbeatTimeout = TimeSpan.Zero, ResubscribeInterval = TimeSpan.Zero,
+        });
+        var completed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.ConnectionStatusChanged += (_, status) =>
+        {
+            if (status.EventType == ConnectionStatusEvent.Connected)
+                completed.TrySetResult(client.EnsureConnectedAsync().Wait(TimeSpan.FromSeconds(2)));
+        };
+        client.EnqueueSubscribe(Guid.NewGuid(), CreateFilter(server.Endpoint));
+        Assert.IsTrue(await completed.Task.WaitAsync(TimeSpan.FromSeconds(4)));
+        Assert.AreEqual(1, server.AcceptedCount);
+        Assert.IsTrue(await WaitUntilAsync(() => server.SubscribeMessages.Count == 1));
+    }
+
+    [TestMethod]
     public async Task Heartbeat_ShouldSendPingAndAcceptPong()
     {
         using var server = Phase6Server.Start(respondToPing: true);
@@ -600,6 +747,24 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
         }
         catch
         {
+        }
+    }
+
+    private sealed class FirstPacingDelay : IWebSocketDelayProvider
+    {
+        internal static readonly TimeSpan Interval = TimeSpan.FromMilliseconds(75);
+        internal readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int pacingCount;
+        internal bool Cancelled;
+        public async Task DelayAsync(TimeSpan delay, CancellationToken token)
+        {
+            if (delay == Interval && Interlocked.Increment(ref pacingCount) == 1)
+            {
+                Entered.TrySetResult();
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+                catch (OperationCanceledException) { Cancelled = true; throw; }
+            }
+            else await Task.Delay(delay, token);
         }
     }
 

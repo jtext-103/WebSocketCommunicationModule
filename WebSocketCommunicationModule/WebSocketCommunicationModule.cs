@@ -61,10 +61,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                     server.Start();
                 }
 
-                WebSocketLog.Logger.Info($"WebSocket running on {options.ListenUri}");
-
                 started = true;
             }
+            WebSocketLog.Logger.Info($"WebSocket running on {options.ListenUri}");
         }
 
         public override void Dispose()
@@ -127,19 +126,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 throw new ArgumentNullException(nameof(filter));
             }
 
-            lock (lifecycleLock)
+            ThrowIfDisposed();
+            var prepared = subscriptionAggregator.Prepare(filter);
+            var logs = new DeferredWebSocketLogs();
+            try
             {
-                ThrowIfDisposed();
-                if (filter.PerformanceLevel is not 0 and not 1)
+                lock (lifecycleLock)
                 {
-                    throw new ArgumentOutOfRangeException(
-                        nameof(filter),
-                        $"Unsupported PerformanceLevel: {filter.PerformanceLevel}");
+                    ThrowIfDisposed();
+                    var plan = subscriptionAggregator.Subscribe(token, prepared);
+                    EnqueueClientPlan(plan, logs);
                 }
-
-                var plan = subscriptionAggregator.Subscribe(token, filter);
-                EnqueueClientPlan(plan);
             }
+            finally { logs.Write(); }
 
             WebSocketLog.Logger.Info($"Subscribe: {token.Host} filter Count: {filter.SourcesAndTypes.Count}");
         }
@@ -151,16 +150,17 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 return;
             }
 
-            lock (lifecycleLock)
+            var logs = new DeferredWebSocketLogs();
+            try
             {
-                if (disposed)
+                lock (lifecycleLock)
                 {
-                    return;
+                    if (disposed) return;
+                    var plan = subscriptionAggregator.Unsubscribe(token);
+                    EnqueueClientPlan(plan, logs);
                 }
-
-                var plan = subscriptionAggregator.Unsubscribe(token);
-                EnqueueClientPlan(plan);
             }
+            finally { logs.Write(); }
         }
 
 

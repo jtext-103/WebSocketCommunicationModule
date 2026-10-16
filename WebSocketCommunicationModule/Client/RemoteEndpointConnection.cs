@@ -5,6 +5,7 @@ using Jtext103.CFET2.WebSocketCommunicationModule.Exceptions;
 using Jtext103.CFET2.WebSocketCommunicationModule.Options;
 using Jtext103.CFET2.WebSocketCommunicationModule.Protocol;
 using System.Net.WebSockets;
+using System.Threading.Channels;
 
 namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 {
@@ -18,7 +19,17 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         private readonly CancellationTokenSource lifetimeCts = new();
         private readonly SemaphoreSlim sendLock = new(1, 1);
         private readonly SemaphoreSlim connectLock = new(1, 1);
+        private readonly SemaphoreSlim flushLock = new(1, 1);
+        private readonly Channel<byte> refreshRequests = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropWrite,
+            SingleReader = true,
+            AllowSynchronousContinuations = false,
+        });
+        private readonly Task refreshTask;
         private readonly object reconnectLock = new();
+        private readonly object connectionStateLock = new();
+        private CancellationTokenSource? connectionCts;
         private readonly RemoteEndpointMessageHandler messageHandler;
         private ClientWebSocket? webSocket;
         private Task? receiveLoopTask;
@@ -51,15 +62,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             messageHandler = new RemoteEndpointMessageHandler(
                 subscriptionStore,
                 IsCurrentGeneration,
-                SendMessageAsync,
+                (socket, message, timeout) => SendMessageAsync(socket, message, timeout),
                 options.SendTimeout,
                 value => lastReceivedAtUtc = value,
                 remoteEventReceived,
                 () => disposed,
+                HandleConnectionFailure,
                 HandleConnectionFailure);
+            refreshTask = Task.Run(ProcessRefreshRequestsAsync);
+            _ = RemoteEndpointBackgroundTask.Observe(refreshTask);
         }
 
-        public RemoteConnectionState State { get; private set; }
+        private volatile RemoteConnectionState state;
+        public RemoteConnectionState State { get => state; private set => state = value; }
 
         internal TimeSpan EffectiveHeartbeatInterval => effectiveHeartbeatInterval;
 
@@ -73,6 +88,24 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         internal string? LastError => lastError;
 
+        // The action reader applies ordered state changes without waiting for network IO
+        // or resubscribe pacing. One retained signal covers changes made during a flush.
+        internal Task RequestRefreshAsync()
+        {
+            if (!disposed) refreshRequests.Writer.TryWrite(0);
+            return Task.CompletedTask;
+        }
+
+        private async Task ProcessRefreshRequestsAsync()
+        {
+            try
+            {
+                await foreach (var _ in refreshRequests.Reader.ReadAllAsync(lifetimeCts.Token).ConfigureAwait(false))
+                    await EnsureConnectedAsync().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (lifetimeCts.IsCancellationRequested) { }
+        }
+
         public async Task EnsureConnectedAsync()
         {
             // double-check the conditions before attempting to connect, in case they have changed while waiting for the lock
@@ -81,6 +114,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 return;
             }
 
+            Exception? failure = null;
+            var notifyConnected = false;
+            long generation = 0;
             await connectLock.WaitAsync(lifetimeCts.Token).ConfigureAwait(false);
             try
             {
@@ -89,25 +125,37 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     return;
                 }
 
-                if (webSocket?.State == WebSocketState.Open && State == RemoteConnectionState.Connected)
+                if (webSocket?.State != WebSocketState.Open || State != RemoteConnectionState.Connected)
                 {
-                    await FlushSubscriptionsAsync().ConfigureAwait(false);
-                    return;
+                    await ConnectAndHandshakeAsync().ConfigureAwait(false);
+                    notifyConnected = State == RemoteConnectionState.Connected;
                 }
-
-                State = RemoteConnectionState.Connecting;
-                await ConnectAndHandshakeAsync().ConfigureAwait(false);
+                generation = Interlocked.Read(ref connectionGeneration);
             }
             catch (OperationCanceledException) when (disposed || lifetimeCts.IsCancellationRequested)
             {
             }
             catch (Exception ex)
             {
-                HandleConnectionFailure(ex);
+                failure = ex;
+                generation = Interlocked.Read(ref connectionGeneration);
             }
             finally
             {
                 connectLock.Release();
+            }
+            if (!IsCurrentGeneration(generation)) return;
+            if (failure != null) { HandleConnectionFailure(failure, generation); return; }
+            try
+            {
+                if (notifyConnected && State == RemoteConnectionState.Connected)
+                    connectionStatusChanged(ConnectionStatusEvent.Connected, "handshake completed", 0);
+                await FlushSubscriptionsAsync().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (disposed || lifetimeCts.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                HandleConnectionFailure(ex, generation);
             }
         }
 
@@ -153,7 +201,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                         HandleConnectionFailure(
                             new TransientConnectionException(
                                 $"unsubscribe failed after {retryCount} retries",
-                                ex));
+                                ex), generation);
                         return;
                     }
 
@@ -166,25 +214,47 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         public void Dispose()
         {
-            if (disposed)
+            ClientWebSocket? socket;
+            CancellationTokenSource? connectionStop;
+            lock (connectionStateLock)
             {
-                return;
+                if (disposed) return;
+                disposed = true;
+                State = RemoteConnectionState.Disposed;
+                Interlocked.Increment(ref connectionGeneration);
+                socket = webSocket;
+                webSocket = null;
+                connectionStop = connectionCts;
+                connectionCts = null;
             }
-
-            disposed = true;
-            State = RemoteConnectionState.Disposed;
+            refreshRequests.Writer.TryComplete();
             lifetimeCts.Cancel();
-            webSocket?.Dispose();
+            connectionStop?.Cancel();
+            connectionStop?.Dispose();
+            socket?.Dispose();
             WaitForBackgroundTasksToStop();
         }
 
         private async Task ConnectAndHandshakeAsync()
         {
             ValidateConfiguration();
-            webSocket?.Dispose();
             var socket = new ClientWebSocket();
-            var generation = Interlocked.Increment(ref connectionGeneration);
-            webSocket = socket;
+            long generation;
+            ClientWebSocket? previousSocket;
+            CancellationTokenSource? previousStop;
+            lock (connectionStateLock)
+            {
+                if (disposed) { socket.Dispose(); return; }
+                generation = Interlocked.Increment(ref connectionGeneration);
+                previousSocket = webSocket;
+                previousStop = connectionCts;
+                webSocket = socket;
+                connectionCts = CancellationTokenSource.CreateLinkedTokenSource(lifetimeCts.Token);
+                State = RemoteConnectionState.Connecting;
+            }
+            previousStop?.Cancel();
+            previousStop?.Dispose();
+            previousSocket?.Dispose();
             socket.Options.AddSubProtocol(WebSocketProtocolConstants.SubProtocol);
 
             if (options.Auth.Enabled && !string.IsNullOrWhiteSpace(options.Auth.Scheme))
@@ -269,32 +339,48 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                         effectiveHeartbeatTimeout));
             }
 
-            retryCount = 0;
-            State = RemoteConnectionState.Connected;
-            receiveLoopTask = RemoteEndpointBackgroundTask.Observe(ReceiveLoopAsync(socket, generation));
-            heartbeatTask = RemoteEndpointBackgroundTask.Observe(
-                HeartbeatLoopAsync(socket, generation, effectiveHeartbeatInterval));
-            subscribeAckTask = RemoteEndpointBackgroundTask.Observe(
-                SubscribeAckLoopAsync(socket, generation));
-            connectionStatusChanged(ConnectionStatusEvent.Connected, "handshake completed", 0);
-            await FlushSubscriptionsAsync().ConfigureAwait(false);
+            lock (connectionStateLock)
+            {
+                if (!IsCurrentGeneration(generation)) return;
+                retryCount = 0;
+                State = RemoteConnectionState.Connected;
+            }
+            receiveLoopTask = Task.Run(() => ReceiveLoopAsync(socket, generation));
+            heartbeatTask = Task.Run(() => HeartbeatLoopAsync(socket, generation, effectiveHeartbeatInterval));
+            subscribeAckTask = Task.Run(() => SubscribeAckLoopAsync(socket, generation));
+            _ = RemoteEndpointBackgroundTask.Observe(receiveLoopTask);
+            _ = RemoteEndpointBackgroundTask.Observe(heartbeatTask);
+            _ = RemoteEndpointBackgroundTask.Observe(subscribeAckTask);
         }
 
         private async Task FlushSubscriptionsAsync()
         {
-            if (disposed || State != RemoteConnectionState.Connected)
+            await flushLock.WaitAsync(lifetimeCts.Token).ConfigureAwait(false);
+            try { await FlushCurrentSubscriptionsAsync().ConfigureAwait(false); }
+            finally { flushLock.Release(); }
+        }
+
+        private async Task FlushCurrentSubscriptionsAsync()
+        {
+            ClientWebSocket socket;
+            long generation;
+            CancellationToken connectionToken;
+            lock (connectionStateLock)
             {
-                return;
+                if (disposed || State != RemoteConnectionState.Connected || webSocket == null) return;
+                socket = webSocket;
+                generation = Interlocked.Read(ref connectionGeneration);
+                connectionToken = connectionCts!.Token;
             }
 
             foreach (var entry in subscriptionStore.Snapshot())
             {
-                if (disposed || State != RemoteConnectionState.Connected)
+                if (!IsCurrentGeneration(generation) || State != RemoteConnectionState.Connected)
                 {
                     return;
                 }
 
-                if (!subscriptionStore.TryMarkSubscribeSending(entry.TokenId))
+                if (!subscriptionStore.TryMarkSubscribeSending(entry.TokenId, out var sending))
                 {
                     continue;
                 }
@@ -302,27 +388,28 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 try
                 {
                     await SendMessageAsync(
+                            socket,
                             new SubscribeMessage
                             {
-                                TokenId = entry.TokenId,
-                                Revision = entry.Revision,
-                                Filter = entry.Filter,
+                                TokenId = sending!.TokenId,
+                                Revision = sending.Revision,
+                                Filter = sending.Filter,
                             },
-                            options.SendTimeout)
+                            options.SendTimeout, () => IsCurrentGeneration(generation) && subscriptionStore.IsCurrent(sending!))
                         .ConfigureAwait(false);
-                    subscriptionStore.MarkSubscribeSent(entry.TokenId, DateTime.UtcNow);
+                    subscriptionStore.MarkSubscribeSent(sending!, DateTime.UtcNow);
 
                     if (options.ResubscribeInterval > TimeSpan.Zero)
                     {
                         await options.DelayProvider
-                            .DelayAsync(options.ResubscribeInterval, lifetimeCts.Token)
+                            .DelayAsync(options.ResubscribeInterval, connectionToken)
                             .ConfigureAwait(false);
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    subscriptionStore.MarkSubscribeSendFailed(entry.TokenId, ex.Message);
-                    HandleConnectionFailure(ex);
+                    subscriptionStore.MarkSubscribeSendFailed(sending!, ex.Message);
+                    HandleConnectionFailure(ex, generation);
                     return;
                 }
             }
@@ -360,7 +447,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 {
                     if (IsCurrentGeneration(generation) && State != RemoteConnectionState.Disposed)
                     {
-                        HandleConnectionFailure(ex);
+                        HandleConnectionFailure(ex, generation);
                     }
 
                     return;
@@ -423,7 +510,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                         DateTime.UtcNow - lastReceivedAtUtc > effectiveHeartbeatTimeout)
                     {
                         socket.Abort();
-                        HandleConnectionFailure(new TransientConnectionException("heartbeat timeout"));
+                        HandleConnectionFailure(new TransientConnectionException("heartbeat timeout"), generation);
                         return;
                     }
 
@@ -438,7 +525,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     if (IsCurrentGeneration(generation) && State != RemoteConnectionState.Disposed)
                     {
                         socket.Abort();
-                        HandleConnectionFailure(ex);
+                        HandleConnectionFailure(ex, generation);
                     }
 
                     return;
@@ -496,15 +583,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                             socket.Abort();
                             HandleConnectionFailure(
                                 new TransientConnectionException(
-                                    $"subscribe ACK timeout after {Math.Max(0, options.MaxSubscribeRetryCount)} retries"));
+                                    $"subscribe ACK timeout after {Math.Max(0, options.MaxSubscribeRetryCount)} retries"), generation);
                             return;
                         }
 
-                        if (!subscriptionStore.TryPrepareSubscribeRetry(
+                        if (!subscriptionStore.TryPrepareRetryEntry(
                                 tokenId,
                                 options.MaxSubscribeRetryCount,
-                                out var filter,
-                                out var revision))
+                                out RemoteSubscriptionEntry? sending))
                         {
                             continue;
                         }
@@ -514,12 +600,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                                 new SubscribeMessage
                                 {
                                     TokenId = tokenId,
-                                    Revision = revision,
-                                    Filter = filter,
+                                    Revision = sending!.Revision,
+                                    Filter = sending.Filter,
                                 },
-                                options.SendTimeout)
+                                options.SendTimeout, () => IsCurrentGeneration(generation) && subscriptionStore.IsCurrent(sending!))
                             .ConfigureAwait(false);
-                        subscriptionStore.MarkSubscribeSent(tokenId, DateTime.UtcNow);
+                        subscriptionStore.MarkSubscribeSent(sending!, DateTime.UtcNow);
                     }
                 }
                 catch (OperationCanceledException) when (disposed || lifetimeCts.IsCancellationRequested)
@@ -531,7 +617,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     if (IsCurrentGeneration(generation) && State != RemoteConnectionState.Disposed)
                     {
                         socket.Abort();
-                        HandleConnectionFailure(ex);
+                        HandleConnectionFailure(ex, generation);
                     }
 
                     return;
@@ -564,7 +650,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                     return;
                 }
 
-                reconnectTask = RemoteEndpointBackgroundTask.Observe(ReconnectLoopAsync(reason));
+                // Task.Run prevents the synchronous prefix (including external callbacks)
+                // from executing on the thread holding reconnectLock.
+                reconnectTask = Task.Run(() => ReconnectLoopAsync(reason));
+                _ = RemoteEndpointBackgroundTask.Observe(reconnectTask);
             }
         }
 
@@ -575,9 +664,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                    State != RemoteConnectionState.Failed &&
                    !subscriptionStore.IsEffectivelyIdle)
             {
-                retryCount++;
-                State = RemoteConnectionState.Reconnecting;
-                subscriptionStore.ResetForReconnect();
+                lock (connectionStateLock)
+                {
+                    if (disposed || State is RemoteConnectionState.Failed or RemoteConnectionState.Connected) return;
+                    retryCount++;
+                    State = RemoteConnectionState.Reconnecting;
+                }
                 connectionStatusChanged(ConnectionStatusEvent.Reconnecting, reason, retryCount);
 
                 try
@@ -619,24 +711,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
         }
 
-        private async Task SendMessageAsync(WebSocketMessageEnvelope message, TimeSpan timeout)
-        {
-            var socket = webSocket;
-            if (socket == null)
-            {
-                throw new InvalidOperationException("WebSocket has not been created.");
-            }
-
-            await SendMessageAsync(socket, message, timeout).ConfigureAwait(false);
-        }
-
-        private async Task SendMessageAsync(ClientWebSocket socket, WebSocketMessageEnvelope message, TimeSpan timeout)
+        private async Task SendMessageAsync(ClientWebSocket socket, WebSocketMessageEnvelope message, TimeSpan timeout, Func<bool>? isValid = null)
         {
             using var sendCts = CreateTimeoutTokenSource(timeout);
             var bytes = WebSocketMessageSerializer.SerializeToUtf8Bytes(message);
             await sendLock.WaitAsync(sendCts.Token).ConfigureAwait(false);
             try
             {
+                if (isValid != null && !isValid()) return;
                 await socket
                     .SendAsync(bytes, WebSocketMessageType.Text, true, sendCts.Token)
                     .ConfigureAwait(false);
@@ -688,7 +770,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         private void WaitForBackgroundTasksToStop()
         {
-            var tasks = new[] { receiveLoopTask, heartbeatTask, subscribeAckTask, reconnectTask }
+            var tasks = new[] { receiveLoopTask, heartbeatTask, subscribeAckTask, reconnectTask, refreshTask }
                 .Where(task => task != null && !task.IsCompleted)
                 .Cast<Task>()
                 .Distinct()
@@ -708,49 +790,39 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         }
 
         private void HandleConnectionFailure(Exception exception)
+            => HandleConnectionFailure(exception, Interlocked.Read(ref connectionGeneration));
+
+        private void HandleConnectionFailure(Exception exception, long generation)
         {
-            if (exception is WebSocketConnectionException and not TransientConnectionException)
+            var terminal = exception is WebSocketConnectionException and not TransientConnectionException;
+            var reason = exception.Message;
+            ClientWebSocket? socket;
+            CancellationTokenSource? connectionStop;
+            lock (connectionStateLock)
             {
-                MarkConnectionFailed(exception.Message);
-                return;
+                if (!IsCurrentGeneration(generation) || State is RemoteConnectionState.Failed or RemoteConnectionState.Disposed) return;
+                // Invalidate the old receive/send loops before a replacement can connect.
+                Interlocked.Increment(ref connectionGeneration);
+                socket = webSocket;
+                webSocket = null;
+                connectionStop = connectionCts;
+                connectionCts = null;
+                connectedAtUtc = null;
+                lastError = reason;
+                State = terminal ? RemoteConnectionState.Failed : RemoteConnectionState.Disconnected;
+                if (terminal) subscriptionStore.MarkActiveOrPendingFailed(reason);
+                else subscriptionStore.ResetForReconnect();
             }
-
-            MarkConnectionDisconnected(exception.Message);
-        }
-
-        private void MarkConnectionDisconnected(string reason)
-        {
-            if (State == RemoteConnectionState.Failed ||
-                State == RemoteConnectionState.Disposed)
+            connectionStop?.Cancel();
+            connectionStop?.Dispose();
+            socket?.Dispose();
+            if (terminal)
             {
-                return;
+                WebSocketLog.Logger.Error($"connect {endpoint} failed! \n" +
+                    $"please check the port is right or remote app is new app using websocketcm or enable websocket server?");
             }
-
-            webSocket?.Dispose();
-            webSocket = null;
-            connectedAtUtc = null;
-            lastError = reason;
-            State = RemoteConnectionState.Disconnected;
-            subscriptionStore.ResetForReconnect();
-            connectionStatusChanged(ConnectionStatusEvent.Disconnected, reason, retryCount);
-            ScheduleReconnectIfNeeded(reason);
-        }
-
-        private void MarkConnectionFailed(string reason)
-        {
-            WebSocketLog.Logger.Error($"connect {endpoint} failed! \n" +
-                $"please check the port is right or remote app is new app using websocketcm or enable websocket server?");
-            webSocket?.Dispose();
-            webSocket = null;
-            connectedAtUtc = null;
-            lastError = reason;
-            if (State != RemoteConnectionState.Disposed)
-            {
-                State = RemoteConnectionState.Failed;
-            }
-
-            subscriptionStore.MarkActiveOrPendingFailed(reason);
-            connectionStatusChanged(ConnectionStatusEvent.Failed, reason, retryCount);
+            try { connectionStatusChanged(terminal ? ConnectionStatusEvent.Failed : ConnectionStatusEvent.Disconnected, reason, retryCount); }
+            finally { if (!terminal) ScheduleReconnectIfNeeded(reason); }
         }
     }
 }

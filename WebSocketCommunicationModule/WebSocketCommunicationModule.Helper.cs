@@ -11,7 +11,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
     public partial class WebSocketCommunicationModule
     {
 
-        private void EnqueueClientPlan(ClientSubscriptionPlan plan)
+        private void EnqueueClientPlan(ClientSubscriptionPlan plan, DeferredWebSocketLogs logs)
         {
             foreach (var reused in plan.ReusedSubscriptions)
             {
@@ -20,7 +20,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                     var failure = existing.GetSubscriptionFailure(reused.MasterTokenId, reused.Revision);
                     if (failure != null)
                     {
-                        WebSocketLog.Logger.Error(failure + " (existing failed subscription reused; no retry sent)");
+                        logs.Error(failure + " (existing failed subscription reused; no retry sent)");
                     }
                 }
             }
@@ -36,12 +36,12 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 {
                     case RemoteEndpointActionKind.Subscribe:
                         var client = endpointClients.GetOrAdd(action.Endpoint, CreateRemoteEndpointClient);
-                        client.EnqueueSubscribe(action.MasterTokenId, action.Revision, action.RemoteFilter!);
+                        client.EnqueueSubscribe(action.MasterTokenId, action.Revision, action.RemoteFilter!, logs);
                         break;
                     case RemoteEndpointActionKind.Unsubscribe:
                         if (endpointClients.TryGetValue(action.Endpoint, out var existingClient))
                         {
-                            existingClient.EnqueueUnsubscribe(action.MasterTokenId);
+                            existingClient.EnqueueUnsubscribe(action.MasterTokenId, logs);
                         }
                         break;
                 }

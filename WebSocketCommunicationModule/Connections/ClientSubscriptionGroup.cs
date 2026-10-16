@@ -14,6 +14,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Connections
 
         public EventFilter RemoteFilter { get; set; } = new();
 
+        internal EventFilter[] Filters { get; init; } = [];
+
+        internal int FullPerformanceTokenCount { get; set; }
+
         public ConcurrentDictionary<Guid, int> LocalTokenIds { get; } = new();
 
         public int EffectivePerformanceLevel { get; set; }
