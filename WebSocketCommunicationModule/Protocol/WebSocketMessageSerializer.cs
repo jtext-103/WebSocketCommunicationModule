@@ -199,12 +199,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
             if (sampleToken is JObject sampleObj)
             {
                 var contextToken = sampleObj["context"];
-                if (contextToken != null && contextToken.Type == JTokenType.Object)
+                if (contextToken is JObject contextObject)
                 {
-                    var rawContext = contextToken.ToObject<Dictionary<string, object>>(JsonSerializer)
-                        ?? new Dictionary<string, object>();
-                    var context = new Dictionary<string, object>(rawContext, StringComparer.InvariantCultureIgnoreCase);
-                    return new Status<object> { Context = context };
+                    return new Status<object> { Context = DeserializeContext(contextObject) };
                 }
 
                 var objectValueToken = sampleObj["objectVal"] ?? sampleObj["val"];
@@ -218,6 +215,42 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
             }
 
             return new Status<object>(sampleToken.ToObject<object>(JsonSerializer)!);
+        }
+
+        private static Dictionary<string, object> DeserializeContext(JObject contextObject)
+        {
+            // Keep Json.NET's complete metadata and reference scope, including nested values.
+            if (HasLeadingContextMetadata(contextObject))
+            {
+                var rawContext = contextObject.ToObject<Dictionary<string, object>>(JsonSerializer)
+                    ?? new Dictionary<string, object>();
+                return new Dictionary<string, object>(rawContext, StringComparer.InvariantCultureIgnoreCase);
+            }
+
+            var context = new Dictionary<string, object>(contextObject.Count, StringComparer.InvariantCultureIgnoreCase);
+            using (var reader = contextObject.CreateReader())
+                JsonSerializer.Populate(reader, context);
+
+            // Populate uses the dictionary indexer. Detect culture-equivalent keys that it
+            // merged, then reproduce Dictionary.Add's previous exception on the error path.
+            if (context.Count != contextObject.Count)
+            {
+                context.Clear();
+                foreach (var property in contextObject.Properties())
+                    context.Add(property.Name, null!);
+            }
+            return context;
+        }
+
+        private static bool HasLeadingContextMetadata(JObject contextObject)
+        {
+            // With the current default MetadataPropertyHandling, only the leading
+            // properties receive special treatment. Populate keeps one reader scope
+            // for nested values, so those need no separate scan or conversion.
+            return contextObject.First is JProperty
+            {
+                Name: "$id" or "$ref" or "$type" or "$values" or "$value"
+            };
         }
 
         private static DateTimeOffset? ReadTimestamp(JToken? token)
