@@ -34,6 +34,44 @@ public sealed class WebSocketFanOutQueueTests : CFET2Host
     private static void KillHubIfAlive() { try { Hub.KillMaster(); } catch { } }
 
     [TestMethod]
+    [DataRow(1)]
+    [DataRow(2)]
+    public async Task SubscriberCounts_PreserveTokensLevelsAndQueuedPayloads(int subscriberCount)
+    {
+        using var manager = new WebSocketSubscriptionManager(MyHub, 2, 1);
+        var sockets = Enumerable.Range(0, subscriberCount).Select(_ => new GateSocket()).ToArray();
+        var sessions = sockets.Select(socket => Session(manager, socket)).ToArray();
+        var tokens = Enumerable.Range(0, subscriberCount).Select(_ => Guid.NewGuid()).ToArray();
+        try
+        {
+            AggregatedServerSubscription group = null!;
+            for (var i = 0; i < subscriberCount; i++)
+            {
+                sockets[i].Release(2);
+                group = Subscribe(manager, sessions[i], tokens[i], level: i % 2);
+            }
+
+            Enqueue(manager, group, 7);
+            Enqueue(manager, group, 8);
+            await Until(() => sockets.All(socket => socket.Messages.Count == 2) &&
+                manager.ActiveFanOutEventCount == 0 && manager.PendingFanOutEventCount == 0);
+
+            for (var i = 0; i < subscriberCount; i++)
+            {
+                CollectionAssert.AreEqual(new[] { 7, 8 }, sockets[i].Values.ToArray());
+                Assert.IsTrue(sockets[i].Messages.All(message =>
+                    message.TokenId == tokens[i] && message.PerformanceLevel == i % 2));
+            }
+            Assert.AreEqual(0L, manager.FanOutQueueFullDropCount);
+        }
+        finally
+        {
+            foreach (var session in sessions) session.Dispose();
+            foreach (var socket in sockets) socket.Dispose();
+        }
+    }
+
+    [TestMethod]
     public async Task Capacity_DropsNewTasks_AcceptsOneFreeSlot_AndRecoversAtHalf()
     {
         using var manager = new WebSocketSubscriptionManager(MyHub, 1, 1, maxPendingFanOutEvents: 4);

@@ -367,7 +367,10 @@ public sealed class WebSocketServerReliabilityTests : CFET2Host
             socket);
         var runTask = session.RunAsync(CancellationToken.None);
 
-        Assert.IsTrue(await WaitUntilAsync(() => GetRemoteSubscriptionCount(manager) == 1));
+        // The scripted socket completes the first two sends without blocking.
+        // Wait for HelloAck and SubscribeAck so the third send is the event.
+        Assert.IsTrue(await WaitUntilAsync(() =>
+            GetRemoteSubscriptionCount(manager) == 1 && socket.SendCount >= 2));
 #pragma warning disable CS0612
         MyHub.Publish(new EventArg("/thing/timeout", "Changed", new Status<int>(42)));
 #pragma warning restore CS0612

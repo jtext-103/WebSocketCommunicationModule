@@ -46,6 +46,7 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
         var token = Guid.NewGuid();
         client.EnqueueSubscribe(token, CreateFilter(server.Endpoint));
         await delay.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        await server.FirstSubscriptionReceived.WaitAsync(TimeSpan.FromSeconds(3));
         await server.SimulateSendFailureAsync("/thing/status", "Changed", 1);
         Assert.IsTrue(await WaitUntilAsync(() => server.AcceptedCount >= 2 && server.SubscribeMessages.Count >= 2));
         Assert.IsTrue(delay.Cancelled);
@@ -855,6 +856,7 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
         private readonly HttpListener listener;
         private readonly List<WebSocket> sockets = new();
         private readonly List<(WebSocket Socket, SubscribeMessage Message)> subscriptions = new();
+        private readonly TaskCompletionSource firstSubscriptionReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly object gate = new();
         private readonly Task acceptLoop;
 
@@ -892,6 +894,8 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
         public bool FirstConnectionClosedAfterSecondSubscribe { get; private set; }
 
         public List<SubscribeMessage> SubscribeMessages { get; } = new();
+
+        public Task FirstSubscriptionReceived => firstSubscriptionReceived.Task;
 
         public static Phase6Server Start(
             bool respondToPing,
@@ -1078,6 +1082,7 @@ public sealed class WebSocketHeartbeatReconnectPhase6Tests : CFET2Host
                             {
                                 SubscribeMessages.Add(subscribe);
                                 subscriptions.Add((wsContext.WebSocket, subscribe));
+                                firstSubscriptionReceived.TrySetResult();
                             }
 
                             await SendAsync(wsContext.WebSocket, new SubscribeAckMessage
