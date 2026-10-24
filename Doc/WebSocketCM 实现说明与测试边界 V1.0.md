@@ -117,7 +117,7 @@ expected cfet2.websocket.event v2, but remote did not complete handshake.
   - WebSocket 连接 URI 为 `ws://host:{port + WebSocketPortOffset}/cfet2/event/v2`
   - `filter.SourcesAndTypes[0].Source = /resource/path`
 
-CFET 节点默认占用两个相邻端口：`http` 端口用于资源访问，`ws` 端口用于事件通信。事件端口为资源端口 + WebSocketPortOffset，默认偏移 1，可在创建 Core 前配置；APP 监听与客户端地址转换使用同一生效快照。HTTP 事件路由由 HttpEventSubscriptionTransport 选择模块，当前标准宿主只支持 WebSocket，选择 MQTT 会明确拒绝启动。`WebSocketCM` 必须在 `GetFullHost("http", host, port)` 中执行该转换。
+CFET 节点默认占用两个相邻端口：`http` 端口用于资源访问，`ws` 端口用于事件通信。事件端口为资源端口 + WebSocketPortOffset，默认偏移 1，可在创建 Core 前配置；APP 监听与客户端地址转换使用同一生效快照。HTTP 事件路由由 HttpEventSubscriptionTransport 选择模块，当前标准宿主支持 WebSocket 和 MQTT；HTTP 事件订阅只使用所选模块，HTTP 初读仍走资源模块。标准宿主仅在发布集合包含 WebSocket 时开启本地 WS 服务端；关闭服务端仍保留客户端订阅能力。`WebSocketCM` 必须在 `GetFullHost("http", host, port)` 中执行该转换。
 
 当前实现区分 Core Host 标识与 WebSocket 连接 URI：
 

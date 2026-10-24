@@ -21,8 +21,8 @@ CFET2 的远程事件通信模块。它通过 WebSocket 实现远程订阅、事
 安装依赖：
 
 ```powershell
-dotnet add package CFET2Core --version 3.1.0
-dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.0.1
+dotnet add package CFET2Core --version 3.2.0
+dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.1.0
 ```
 
 注册模块和诊断 Thing：
@@ -69,4 +69,16 @@ host.MyHub.TryAddThing(new WebSocketCMThing(webSocketCm), "/", "websocketcm");
 - [类职责分析](<Doc/WebSocket类职责分析.md>)
 - [PerformanceLevel 设计](<Doc/PerformanceLevel实现文档.md>)
 - [WebSocketCMThing 设计](<Doc/WebSocketCMThing设计文档.md>)
+- [正则资源订阅](Doc/WebSocket实现正则订阅方案.md)
+- [有界事件分发队列](Doc/WebSocket有界事件分发队列修改方案.md)
+- [性能优化与对象复用](Doc/性能优化与对象复用/README.md)
+- [正则资源订阅](Doc/WebSocket实现正则订阅方案.md)
+- [有界事件分发队列](Doc/WebSocket有界事件分发队列修改方案.md)
+- [性能优化与对象复用](Doc/性能优化与对象复用/README.md)
 - [历史方案](Expired/)
+
+## 构建与发布
+
+当前 `.gitlab-ci.yml` 在默认分支执行版本更新、Release 测试、构建和打包，并在 publish 阶段推送 NuGet。Core、HTTP、WebSocket、MQTT 按此顺序处理依赖，先确认所需 Core 包可还原，再更新下游固定包版本。
+
+提交说明末尾的 `-a` 升主版本并清零次版本和修订号，`-b` 升次版本并清零修订号；没有这两个末尾标记时升修订号。独立的 `-notest` 标记跳过测试，但仍执行构建、打包和发布；组合示例为 `发布更新 -notest -b`。CI 默认遍历仓库内测试项目，执行 `dotnet test --configuration Release`；没有配置真实 Broker 开关和工具时，不能将流水线通过视为 MQTT 网络集成验证通过。
