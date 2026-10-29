@@ -29,7 +29,7 @@ CFET2 的远程事件通信模块。它通过 WebSocket 实现远程订阅、事
 
 ```powershell
 dotnet add package CFET2Core --version 3.3.0
-dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.2.1
+dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.2.2
 ```
 
 注册模块和诊断 Thing：
