@@ -9,23 +9,26 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         public string Source { get; }
 
         public string EventType { get; }
-        public ServerSubscriptionKey(string source, string eventType)
+        public bool IsResourceSubscription { get; }
+        public ServerSubscriptionKey(string source, string eventType, bool isResourceSubscription = false)
         {
             Source = source;
             EventType = eventType;
+            IsResourceSubscription = isResourceSubscription;
         }
 
         public bool Equals(ServerSubscriptionKey other)
         {
             return SubscriptionExpression.Equal(Source, other.Source)
-                && SubscriptionExpression.Equal(EventType, other.EventType);
+                && SubscriptionExpression.Equal(EventType, other.EventType)
+                && IsResourceSubscription == other.IsResourceSubscription;
         }
 
         public override int GetHashCode()
         {
             return HashCode.Combine(
                 SubscriptionExpression.Hash(Source),
-                SubscriptionExpression.Hash(EventType));
+                SubscriptionExpression.Hash(EventType), IsResourceSubscription);
         }
     }
 }

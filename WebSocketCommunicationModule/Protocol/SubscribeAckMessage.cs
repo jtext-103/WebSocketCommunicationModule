@@ -16,5 +16,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
         public bool Accepted { get; init; }
 
         public string? Reason { get; init; }
+        public string[]? SkippedResources { get; init; }
+        public bool Skipped { get; init; }
     }
 }

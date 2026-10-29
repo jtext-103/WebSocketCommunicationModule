@@ -200,10 +200,11 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 lock (lifecycleLock)
                 {
                     if (!IsValid()) return;
-                    if (result.Accepted) remoteTokens[tokenId] = 0;
+                    if (result.Accepted && !result.Skipped) remoteTokens[tokenId] = 0;
+                    else if (result.Skipped) remoteTokens.TryRemove(tokenId, out _);
                 }
                 var payload = SerializeMessage(new SubscribeAckMessage
-                { TokenId = tokenId, Revision = result.Revision, Accepted = result.Accepted, Reason = result.Reason });
+                { TokenId = tokenId, Revision = result.Revision, Accepted = result.Accepted, Reason = result.Reason, SkippedResources = result.SkippedResources, Skipped = result.Skipped });
                 await SendPayloadAsync(payload, cancellationToken, IsValid).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (preparation.IsCanceled || cancellationToken.IsCancellationRequested || cts.IsCancellationRequested) { }
@@ -250,6 +251,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 {
                     TokenId = remoteTokenId,
                     PerformanceLevel = performanceLevel,
+                    NoEvent = eventArg.NoEvent,
                     Source = performanceLevel == 1 ? eventArg.Source : null,
                     EventType = performanceLevel == 1 ? eventArg.EventType : null,
                     Value = performanceLevel == 1 ? eventArg.Sample?.ObjectVal : null,
@@ -295,6 +297,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server
                 PerformanceLevel = 0,
                 Host = eventArg.Host,
                 Source = eventArg.Source,
+                NoEvent = eventArg.NoEvent,
                 EventType = eventArg.EventType,
                 Sample = eventArg.Sample,
             };

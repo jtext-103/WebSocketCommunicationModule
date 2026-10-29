@@ -48,6 +48,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
                 SubscribeSentAtUtc = entry.SubscribeSentAtUtc,
                 SubscribeRetryCount = entry.SubscribeRetryCount,
                 LastError = entry.LastError,
+                SkippedResources = entry.SkippedResources.ToArray(),
             };
         }
     }

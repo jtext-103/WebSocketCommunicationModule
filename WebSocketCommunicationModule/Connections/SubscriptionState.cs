@@ -5,6 +5,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Connections
         Pending,
         Active,
         Cancelling,
-        Failed
+        Failed,
+        Skipped
     }
 }

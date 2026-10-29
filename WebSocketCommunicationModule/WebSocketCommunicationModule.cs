@@ -12,7 +12,7 @@ using System.Threading.Tasks;
 
 namespace Jtext103.CFET2.WebSocketCommunicationModule
 {
-    public partial class WebSocketCommunicationModule : IEventCommunicationModule
+    public partial class WebSocketCommunicationModule : IEventCommunicationModule, IRemoteEventDispatchGuard
     {
         public override Jtext103.CFET2.Core.Config.EventTransport? Transport => Jtext103.CFET2.Core.Config.EventTransport.WebSocket;
 

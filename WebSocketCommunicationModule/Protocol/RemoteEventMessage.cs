@@ -13,6 +13,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
         public Guid? TokenId { get; init; }
 
         public int PerformanceLevel { get; init; }
+        public bool NoEvent { get; init; }
 
         public string? Source { get; init; }
 

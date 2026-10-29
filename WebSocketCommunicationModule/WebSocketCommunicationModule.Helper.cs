@@ -63,6 +63,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
                 return;
             }
 
+            if (message.TokenId is Guid masterTokenId && client.GetSubscription(masterTokenId) is { } subscription)
+                eventRoutes.Add(message.EventArg, new EventRoute(client.Endpoint, subscription.Filter.IsResourceSubscription));
             RaiseRemoteEvent(client.Endpoint, message.EventArg);
         }
 

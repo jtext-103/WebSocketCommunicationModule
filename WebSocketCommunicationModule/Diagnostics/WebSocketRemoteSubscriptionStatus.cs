@@ -24,6 +24,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Diagnostics
 
         public int SubscribeRetryCount { get; init; }
 
+        public string[] SkippedResources { get; set; } = Array.Empty<string>();
+
         public string? LastError { get; init; }
     }
 }

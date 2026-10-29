@@ -70,7 +70,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         {
             ArgumentNullException.ThrowIfNull(session);
             ArgumentNullException.ThrowIfNull(remoteFilter);
-            var keys = remoteFilter.SourcesAndTypes.Select(r => new ServerSubscriptionKey(r.Source, r.EventType)).Distinct().ToArray();
+            var keys = remoteFilter.SourcesAndTypes.Select(r => new ServerSubscriptionKey(r.Source, r.EventType, remoteFilter.IsResourceSubscription)).Distinct().ToArray();
             var signature = CreateFilterSignature(keys);
             var keySet = keys.ToHashSet();
             var key = new RemoteSubscriptionKey(session.Id, remoteTokenId);
@@ -92,7 +92,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                 if (remoteFilter.PerformanceLevel is not 0 and not 1) throw new ArgumentException("Unsupported PerformanceLevel: " + remoteFilter.PerformanceLevel);
                 foreach (var groupKey in keys)
                     if (!filters.ContainsKey(groupKey))
-                        filters[groupKey] = new EventFilter(groupKey.Source, groupKey.EventType, 0, string.Empty);
+                        filters[groupKey] = new EventFilter(groupKey.Source, groupKey.EventType, 0, string.Empty) { IsResourceSubscription = groupKey.IsResourceSubscription };
             }
             catch (Exception ex) { validationError = ex; }
             List<Preparation> starts;
@@ -239,17 +239,19 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         {
             if (!request.Pending || request.Needs.Any(p => !p.Ready)) return;
             var oldKeys = remoteIndex.TryGetValue(request.Key, out var old) ? old : Array.Empty<ServerSubscriptionKey>();
-            var next = request.Needs.Select(p => p.Key).ToArray();
-            foreach (var prep in request.Needs)
+            var skipped = request.Needs.SelectMany(p => p.Group.SkippedResources).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var next = request.Needs.Where(p => !p.Group.IsSkipped).Select(p => p.Key).ToArray();
+            foreach (var prep in request.Needs.Where(p => !p.Group.IsSkipped))
             {
                 prep.Group.Subscribers[request.Key] = request.Subscriber;
                 changedGroups.Add(prep.Group);
                 aggregatedSubscriptions[prep.Key] = prep.Group;
             }
-            remoteIndex[request.Key] = next;
+            if (next.Length != 0) remoteIndex[request.Key] = next;
+            else remoteIndex.TryRemove(request.Key, out _);
             foreach (var oldKey in oldKeys.Except(next)) RemoveSubscriber(oldKey, request.Key, cleanup);
             ReleaseNeeds(request, cleanup);
-            request.Completion.TrySetResult(new ServerSubscribeResult(request.Subscriber.Revision, true, null));
+            request.Completion.TrySetResult(new ServerSubscribeResult(request.Subscriber.Revision, true, null, skipped, next.Length == 0));
         }
         private void ReleaseNeeds(Request request, List<AggregatedServerSubscription> cleanup)
         {
@@ -366,7 +368,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
         internal int QueuedPreparationCount { get { lock (syncRoot) return queue.Count; } }
         internal int PendingRequestCount { get { lock (syncRoot) return pendingRequests; } }
         private static string CreateFilterSignature(IEnumerable<ServerSubscriptionKey> keys) => string.Concat(
-            keys.Select(k => Connections.SubscriptionExpression.Encode(k.Source) + Connections.SubscriptionExpression.Encode(k.EventType))
+            keys.Select(k => Connections.SubscriptionExpression.Encode(k.Source) + Connections.SubscriptionExpression.Encode(k.EventType) + (k.IsResourceSubscription ? "R" : "E"))
                 .OrderBy(s => s, StringComparer.Ordinal).Select(s => s.Length + ":" + s));
         private void DisposeGroups(IEnumerable<AggregatedServerSubscription> groups)
         { foreach (var group in groups.Distinct()) UnsubscribeLocal(group); }
@@ -397,6 +399,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
 
         private void SubscribeLocal(ServerSubscriptionKey key, AggregatedServerSubscription aggregated)
         {
+            if (!key.IsResourceSubscription && (!IsExactLocalResourcePath(key.Source) || hub.FindLocalResourceWithPath(key.Source).NoEvent))
+            {
+                var ordinary = hub.SubscribeEventsWithObservation(aggregated.LocalFilter,
+                    eventArg => TryEnqueueFanOut(aggregated, eventArg));
+                aggregated.LocalToken = ordinary.Token;
+                aggregated.LocalSubscription = ordinary;
+                return;
+            }
             if (IsExactLocalResourcePath(key.Source))
             {
                 var resourceSubscription = hub.SubscribeResource(
@@ -404,7 +414,9 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
                     eventArg => TryEnqueueFanOut(aggregated, eventArg),
                     key.EventType);
 
-                aggregated.LocalToken = resourceSubscription.Token;
+                aggregated.IsSkipped = resourceSubscription.Status == ResourceSubscriptionStatus.Skipped;
+                if (aggregated.IsSkipped) aggregated.SkippedResources = new[] { key.Source };
+                aggregated.LocalToken = aggregated.IsSkipped ? null : resourceSubscription.Token;
                 aggregated.LocalSubscription = resourceSubscription;
                 return;
             }
@@ -412,7 +424,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Server.Subscriptions
             var subscription = hub.SubscribeResources(
                 aggregated.LocalFilter,
                 eventArg => TryEnqueueFanOut(aggregated, eventArg));
-            aggregated.LocalToken = subscription.Token;
+            aggregated.IsSkipped = subscription.Status == ResourceSubscriptionStatus.Skipped;
+            aggregated.SkippedResources = subscription.ObservationResults
+                .Where(r => r.ReasonCode == ResourceObservationReason.NoEvent).Select(r => r.ResourcePath).ToArray();
+            aggregated.LocalToken = aggregated.IsSkipped ? null : subscription.Token;
             aggregated.LocalSubscription = subscription;
         }
 

@@ -285,9 +285,10 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
                 if (message.Accepted)
                 {
-                    entry.State = SubscriptionState.Active;
+                    entry.State = message.Skipped ? SubscriptionState.Skipped : SubscriptionState.Active;
+                    entry.SkippedResources = message.SkippedResources?.ToArray() ?? Array.Empty<string>();
                     entry.LastAcceptedRevision = message.Revision;
-                    entry.ActivatedAtUtc = DateTime.UtcNow;
+                    entry.ActivatedAtUtc = message.Skipped ? null : DateTime.UtcNow;
                     entry.LastError = null;
                     entry.SubscribeSentAtUtc = null;
                     entry.SubscribeSendInProgress = false;
@@ -354,7 +355,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             {
                 foreach (var entry in subscriptions.Values.ToArray())
                 {
-                    if (entry.State == SubscriptionState.Active || entry.State == SubscriptionState.Pending)
+                    if (entry.State == SubscriptionState.Active || entry.State == SubscriptionState.Pending || entry.State == SubscriptionState.Skipped)
                     {
                         // A send finishing on the old connection must not mark the new
                         // attempt as sent or clear its in-progress flag.

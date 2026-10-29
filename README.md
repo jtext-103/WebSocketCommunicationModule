@@ -1,5 +1,12 @@
 # CFET2 WebSocket Communication Module
 
+## Cfet2NoEvent
+
+资源订阅过滤器携带 `IsResourceSubscription=true`，与普通事件订阅分别聚合。服务端跳过 NoEvent 资源，不读初值、不创建观察；`subscribeAck` 的 `SkippedResources` 提供路径诊断，`Skipped=true` 表示整个请求被跳过，`Accepted=true` 表示该请求已正常处理。客户端状态为 `Skipped`，不按失败重试；重连后重新判断源端元数据。
+
+混合批次只保留允许的资源。普通事件订阅仍可接收 NoEvent 资源主动发布的事件。完整和精简事件都传递源端 `NoEvent`；客户端按远端 Token 对应的订阅种类约束 Core 的分发，防止两类聚合组之间重复投递。完整语义要求两端升级。
+
+
 CFET2 的远程事件通信模块。它通过 WebSocket 实现远程订阅、事件回流、取消订阅、心跳和重连，并支持客户端与服务端订阅聚合。
 
 ## 功能
@@ -21,8 +28,8 @@ CFET2 的远程事件通信模块。它通过 WebSocket 实现远程订阅、事
 安装依赖：
 
 ```powershell
-dotnet add package CFET2Core --version 3.2.0
-dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.1.0
+dotnet add package CFET2Core --version 3.3.0
+dotnet add package Jtext103.CFET2.WebSocketCommunicationModule --version 1.2.0
 ```
 
 注册模块和诊断 Thing：

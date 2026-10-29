@@ -156,6 +156,13 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             }
         }
 
+        internal bool HasSubscriptionKind(Guid localTokenId, RemoteEndpointKey endpoint, bool resourceSubscription)
+        {
+            lock (syncRoot)
+                return localSubscriptionIndex.TryGetValue(localTokenId, out var binding) &&
+                    binding.Endpoint.Equals(endpoint) && binding.GroupKeys.Any(key => key.IsResourceSubscription == resourceSubscription);
+        }
+
         public void Clear()
         {
             lock (syncRoot)
@@ -282,7 +289,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
         {
             return filter.SourcesAndTypes
                 .Where(rule => !string.IsNullOrWhiteSpace(rule.Source) && !string.IsNullOrWhiteSpace(rule.EventType))
-                .Select(rule => new ClientSubscriptionGroupKey(endpoint, rule.Source, rule.EventType))
+                .Select(rule => new ClientSubscriptionGroupKey(endpoint, rule.Source, rule.EventType, filter.IsResourceSubscription))
                 .Distinct();
         }
 
@@ -294,6 +301,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
             var remoteFilter = new EventFilter
             {
                 Host = host,
+                IsResourceSubscription = groupKey.IsResourceSubscription,
                 PerformanceLevel = performanceLevel,
             };
             remoteFilter.AddSourceAndType(groupKey.Source, groupKey.EventType);

@@ -131,6 +131,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
                     {
                         TokenId = ReadNullableGuid(obj["tokenId"]),
                         PerformanceLevel = 1,
+                        NoEvent = obj.Value<bool?>("noEvent") ?? false,
                         Source = obj.Value<string>("source") ?? string.Empty,
                         EventType = obj.Value<string>("eventType") ?? string.Empty,
                         Value = valueToken?.ToObject<object>(JsonSerializer),
@@ -138,6 +139,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
                         EventArg = new EventArg
                         {
                             PerformanceLevel = 1,
+                            NoEvent = obj.Value<bool?>("noEvent") ?? false,
                             Source = obj.Value<string>("source") ?? string.Empty,
                             EventType = obj.Value<string>("eventType") ?? string.Empty,
                             Sample = new Status<object>(valueToken?.ToObject<object>(JsonSerializer)!)
@@ -160,6 +162,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
             var eventArg = new EventArg
             {
                 PerformanceLevel = eventArgObj.Value<int?>("performanceLevel") ?? 0,
+                NoEvent = eventArgObj.Value<bool?>("noEvent") ?? false,
                 Host = eventArgObj.Value<string>("host") ?? string.Empty,
                 Source = eventArgObj.Value<string>("source") ?? string.Empty,
                 EventType = eventArgObj.Value<string>("eventType") ?? string.Empty,
@@ -170,6 +173,7 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Protocol
             {
                 TokenId = ReadNullableGuid(obj["tokenId"]),
                 PerformanceLevel = eventArg.PerformanceLevel,
+                NoEvent = eventArg.NoEvent,
                 EventArg = eventArg,
             };
         }

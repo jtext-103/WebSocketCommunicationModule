@@ -6,6 +6,14 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule
 {
     public partial class WebSocketCommunicationModule
     {
+        // Core queues the same EventArg. Weak keys retain routing only as long as that event lives.
+        private readonly System.Runtime.CompilerServices.ConditionalWeakTable<EventArg, EventRoute> eventRoutes = new();
+        private sealed record EventRoute(RemoteEndpointKey Endpoint, bool IsResourceSubscription);
+
+        public bool ShouldDispatch(Guid tokenId, EventArg eventArg) => !disposed &&
+            (!eventRoutes.TryGetValue(eventArg, out var route) ||
+             subscriptionAggregator.HasSubscriptionKind(tokenId, route.Endpoint, route.IsResourceSubscription));
+
         private void RaiseRemoteEvent(RemoteEndpointKey endpoint, EventArg eventArg)
         {
             if (eventArg == null || disposed)

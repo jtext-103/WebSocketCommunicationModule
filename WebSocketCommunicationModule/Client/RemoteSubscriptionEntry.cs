@@ -28,6 +28,8 @@ namespace Jtext103.CFET2.WebSocketCommunicationModule.Client
 
         internal bool SubscribeSendInProgress { get; set; }
 
+        public string[] SkippedResources { get; set; } = Array.Empty<string>();
+
         public string? LastError { get; set; }
     }
 }
